@@ -541,6 +541,7 @@ class BrainGraphDataset(InMemoryDataset):
         if self.anatomical_df is not None:
             feature_name = "volume"
             indices[feature_name] = idx
+            idx += 1
 
         # Graph features are always in the same order: degree, strength, clustering, eigenvec, participation
         graph_feature_names = ['degree', 'strength', 'clustering', 'eigenvector_centrality', 'participation_coefficient']
