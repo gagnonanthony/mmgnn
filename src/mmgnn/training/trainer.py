@@ -144,18 +144,26 @@ class Trainer:
     @staticmethod
     def _classification_metrics(logits: torch.Tensor, targets: torch.Tensor) -> Dict[str, float]:
         """Compute accuracy and macro-F1 from logits and class indices."""
+        if logits.ndim == 1:
+            logits = logits.unsqueeze(-1)
         if logits.ndim != 2:
-            raise ValueError(f"Expected logits shape [B, C], got {tuple(logits.shape)}")
+            raise ValueError(f"Expected logits shape [B, C] or [B], got {tuple(logits.shape)}")
 
         y_true = Trainer._extract_class_indices(targets)
-        y_pred = torch.argmax(logits, dim=1)
+
+        if logits.shape[1] == 1:
+            probs = torch.sigmoid(logits.squeeze(-1))
+            y_pred = (probs >= 0.5).to(dtype=torch.long)
+            num_classes = 2
+        else:
+            y_pred = torch.argmax(logits, dim=1)
+            num_classes = int(logits.shape[1])
 
         if y_pred.numel() == 0:
             return {"accuracy": float("nan"), "f1": float("nan")}
 
         accuracy = (y_pred == y_true).float().mean().item()
 
-        num_classes = int(logits.shape[1])
         conf = torch.bincount(
             y_true * num_classes + y_pred,
             minlength=num_classes * num_classes,
@@ -310,13 +318,22 @@ class Trainer:
 
         if self.task_type == "classification":
             metrics = self._classification_metrics(preds_t, targets_t)
-            pred_classes = torch.argmax(preds_t, dim=1)
             true_classes = self._extract_class_indices(targets_t)
-            probabilities = torch.softmax(preds_t, dim=1)
 
-            target_memberships = None
-            if targets_t.ndim == 2 and targets_t.shape[-1] > 1:
-                target_memberships = targets_t.numpy()
+            if preds_t.ndim == 1:
+                preds_t = preds_t.unsqueeze(-1)
+
+            if preds_t.shape[1] == 1:
+                positive_prob = torch.sigmoid(preds_t.squeeze(-1))
+                pred_classes = (positive_prob >= 0.5).to(dtype=torch.long)
+                probabilities = torch.stack([1.0 - positive_prob, positive_prob], dim=1)
+                target_memberships = torch.nn.functional.one_hot(true_classes, num_classes=2).to(dtype=torch.float32)
+            else:
+                pred_classes = torch.argmax(preds_t, dim=1)
+                probabilities = torch.softmax(preds_t, dim=1)
+                target_memberships = None
+                if targets_t.ndim == 2 and targets_t.shape[-1] > 1:
+                    target_memberships = targets_t.to(dtype=torch.float32)
 
             return {
                 "accuracy": metrics["accuracy"],

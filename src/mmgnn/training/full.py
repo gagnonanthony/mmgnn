@@ -145,6 +145,13 @@ def _normalize_task_config(
     task = task_type.lower().strip()
     mode = classification_target_mode.lower().strip()
     loss = loss_function.lower().strip()
+    binary_losses = {
+        "binary_cross_entropy",
+        "binary_cross_entropy_with_logits",
+        "binarycrossentropylogits",
+        "bce",
+        "focal",
+    }
 
     if task not in {"regression", "classification"}:
         raise ValueError("task_type must be either 'regression' or 'classification'")
@@ -155,11 +162,14 @@ def _normalize_task_config(
     if task == "classification" and ilr_transform:
         raise ValueError("ILR transform is only compatible with regression targets")
 
-    if task == "classification" and loss not in {"cross_entropy", "ce"}:
-        raise ValueError("Classification mode currently requires 'cross_entropy' (or 'ce') loss")
+    if task == "classification" and loss not in {"cross_entropy", "ce", *binary_losses}:
+        raise ValueError(
+            "Classification mode currently requires 'cross_entropy' (or 'ce') or "
+            "'binary_cross_entropy' (or 'bce') loss"
+        )
 
-    if task == "regression" and loss in {"cross_entropy", "ce"}:
-        raise ValueError("Cross-entropy loss is only valid for classification mode")
+    if task == "regression" and loss in {"cross_entropy", "ce", *binary_losses}:
+        raise ValueError("Classification losses are only valid for classification mode")
 
     return task, mode, loss
 
@@ -296,6 +306,74 @@ def _convert_membership_targets_to_class_indices(data_list: list) -> list:
     return converted
 
 
+def _convert_binary_targets_to_scalars(data_list: list) -> list:
+    """Convert per-graph binary targets to scalar 0/1 labels for BCE training."""
+    converted = []
+    for data in data_list:
+        updated = data.clone()
+        y = _squeeze_graph_target(updated.y)
+
+        if y.ndim == 1 and y.numel() > 1:
+            if y.numel() != 2:
+                raise ValueError(
+                    "binary_cross_entropy requires binary targets with exactly two membership values "
+                    "or scalar 0/1 labels"
+                )
+            label = torch.argmax(y).to(dtype=torch.float32)
+        else:
+            label = torch.as_tensor(y).reshape(-1)[0].to(dtype=torch.float32)
+
+        if float(label.item()) not in {0.0, 1.0}:
+            raise ValueError(
+                "binary_cross_entropy requires scalar targets in {0, 1} or two-class membership vectors"
+            )
+
+        updated.y = label
+        converted.append(updated)
+
+    return converted
+
+
+def _compute_binary_pos_weight(train_data: list, mode: str = "balanced") -> torch.Tensor:
+    """Compute the BCE positive-class weight from scalar binary targets."""
+    mode_normalized = mode.lower().strip()
+    if mode_normalized not in {"balanced", "sqrt_balanced", "log_balanced"}:
+        raise ValueError("class_weight_mode must be one of: 'balanced', 'sqrt_balanced', 'log_balanced'")
+
+    labels = []
+    for data in train_data:
+        y = _squeeze_graph_target(data.y)
+        if y.ndim == 1 and y.numel() > 1:
+            if y.numel() != 2:
+                raise ValueError("binary_cross_entropy class weighting requires binary two-class targets")
+            label = int(torch.argmax(y).item())
+        else:
+            label = int(torch.as_tensor(y).reshape(-1)[0].item())
+
+        if label not in {0, 1}:
+            raise ValueError("binary_cross_entropy requires scalar targets in {0, 1}")
+        labels.append(label)
+
+    labels_tensor = torch.tensor(labels, dtype=torch.long)
+    positive_count = int((labels_tensor == 1).sum().item())
+    negative_count = int((labels_tensor == 0).sum().item())
+
+    if positive_count == 0 or negative_count == 0:
+        raise ValueError(
+            "Cannot compute binary class weights because one class is missing in the train split"
+        )
+
+    ratio = negative_count / positive_count
+    if mode_normalized == "balanced":
+        pos_weight = ratio
+    elif mode_normalized == "sqrt_balanced":
+        pos_weight = ratio ** 0.5
+    else:
+        pos_weight = torch.log1p(torch.tensor(ratio, dtype=torch.float32)).item()
+
+    return torch.tensor([pos_weight], dtype=torch.float32)
+
+
 def run_experiment(
     dataset,
     conv_type: str,
@@ -320,6 +398,9 @@ def run_experiment(
     node_feature_keys: Optional[list] = None,
     edge_feature_keys: Optional[list] = None,
     target_keys: Optional[list] = None,
+    add_virtual_node: bool = False,
+    add_node_type_feature: bool = True,
+    virtual_edge_strategy: str = "zeros",
     normalize_data: bool = True,
     normalize_nodes: bool = True,
     normalize_edges: bool = True,
@@ -382,6 +463,9 @@ def run_experiment(
         "node_feature_keys": node_feature_keys,
         "edge_feature_keys": edge_feature_keys,
         "target_keys": target_keys,
+        "add_virtual_node": add_virtual_node,
+        "add_node_type_feature": add_node_type_feature,
+        "virtual_edge_strategy": virtual_edge_strategy,
         "normalize_data": normalize_data,
         "normalize_nodes": normalize_nodes,
         "normalize_edges": normalize_edges,
@@ -412,6 +496,13 @@ def run_experiment(
 
     checkpoint_dir = Path(checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    is_binary_bce = task_type == "classification" and loss_function in {
+        "binary_cross_entropy",
+        "binary_cross_entropy_with_logits",
+        "binarycrossentropylogits",
+        "bce",
+        "focal",
+    }
 
     # Step 1: Feature Selection
     feature_selector = FeatureSelector(
@@ -467,7 +558,13 @@ def run_experiment(
         # Save ILR transform parameters for later inverse transformation.
         logger.info("Saved ILR transform parameters to %s", checkpoint_dir / "ilr_transform_params.json")
 
-    if task_type == "classification" and classification_target_mode == "argmax":
+    if is_binary_bce:
+        train_data = _convert_binary_targets_to_scalars(train_data)
+        if val_data is not None:
+            val_data = _convert_binary_targets_to_scalars(val_data)
+        if test_data is not None:
+            test_data = _convert_binary_targets_to_scalars(test_data)
+    elif task_type == "classification" and classification_target_mode == "argmax":
         train_data = _convert_membership_targets_to_class_indices(train_data)
         if val_data is not None:
             val_data = _convert_membership_targets_to_class_indices(val_data)
@@ -496,10 +593,24 @@ def run_experiment(
 
     # Step 3: Model Initialization
     sample_graph = train_data[0]
+    sample_has_virtual_node = bool(getattr(sample_graph, "has_virtual_node", False))
+    if add_virtual_node and not sample_has_virtual_node:
+        logger.warning(
+            "add_virtual_node=True but dataset samples do not advertise has_virtual_node=True. "
+            "Make sure your dataset loader enables virtual-node preprocessing."
+        )
+    if not add_virtual_node and sample_has_virtual_node:
+        logger.info(
+            "Dataset contains virtual-node metadata while add_virtual_node=False. "
+            "Continuing with dataset-provided tensors."
+        )
+
     num_node_features = sample_graph.x.size(-1)
     sample_edge_attr = getattr(sample_graph, "edge_attr", None)
     num_edge_features = sample_edge_attr.size(-1) if sample_edge_attr is not None else 0
-    if task_type == "classification":
+    if is_binary_bce:
+        out_dim = 1
+    elif task_type == "classification":
         out_dim = _infer_num_classes(train_data=train_data, val_data=val_data, test_data=test_data)
     else:
         out_dim = sample_graph.y.size(-1) if getattr(sample_graph, "y", None) is not None else 1
@@ -591,6 +702,35 @@ def run_experiment(
         prepared_loss_kwargs["weight"] = class_weights
         logger.info("Using class-weighted cross-entropy with weights: %s", class_weights.tolist())
         criterion = LossSelector(loss_function, **prepared_loss_kwargs)
+
+    if (
+        is_binary_bce
+        and class_weighting
+        and loss_function in {
+            "binary_cross_entropy",
+            "binary_cross_entropy_with_logits",
+            "binarycrossentropylogits",
+            "bce",
+        }
+    ):
+        prepared_loss_kwargs = dict(loss_kwargs or {})
+        if "pos_weight" in prepared_loss_kwargs or "weight" in prepared_loss_kwargs:
+            raise ValueError(
+                "loss_kwargs already contains 'pos_weight' or 'weight'. Use either class_weighting=True or explicit weighting kwargs, not both."
+            )
+
+        pos_weight = _compute_binary_pos_weight(train_data=train_data, mode=class_weight_mode)
+        prepared_loss_kwargs["pos_weight"] = pos_weight
+        logger.info("Using class-weighted BCEWithLogitsLoss with pos_weight=%s", pos_weight.tolist())
+        criterion = LossSelector(loss_function, **prepared_loss_kwargs)
+
+    if loss_function == "focal":
+        if "gamma" not in (loss_kwargs or {}):
+            raise ValueError("Focal loss requires 'gamma' parameter in loss_kwargs")
+        logger.info("Using focal loss with gamma=%.2f", loss_kwargs["gamma"])
+        if "alpha" not in (loss_kwargs or {}):
+            raise ValueError("Focal loss requires 'alpha' parameter in loss_kwargs")
+        logger.info("Focal loss alpha parameter set to %.2f", loss_kwargs["alpha"])
 
     trainer = Trainer(
         model=model,
