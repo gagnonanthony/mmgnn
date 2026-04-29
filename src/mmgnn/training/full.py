@@ -24,6 +24,7 @@ from ..data.normalization import NormalizationStats
 from .splits import DataSplitter
 from ..models.mmgnn import MMGNN, initialize_model_weights
 from ..models.backbone import GNN
+from ..models import GAE, Encoder
 from .losses import LossSelector
 from .sampler import BalancedSampler
 
@@ -391,7 +392,7 @@ def run_experiment(
     jumping_knowledge_mode: str = None,
     val_subjects: str = None,
     test_subjects: str = None,
-    task_type: str = "regression",
+    task_type: str = None,
     classification_target_mode: str = "argmax",
     class_weighting: bool = False,
     class_weight_mode: str = "balanced",
@@ -428,6 +429,15 @@ def run_experiment(
     device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
     verbose: bool = True,
     generate_artifacts: bool = True,
+    # Model selection: 'mmgnn' (default) or 'gae'
+    model_type: str = "mmgnn",
+    # GAE-specific training knobs
+    neg_sampling_ratio: float = 1.0,
+    recon_edge_presence_weight: float = 1.0,
+    recon_node_attr_weight: float = 1.0,
+    recon_edge_attr_weight: float = 1.0,
+    recon_node_loss_type: str = "mse",
+    recon_edge_attr_loss_type: str = "mse",
 ) -> Dict[str, Any]:
     """
     Runs a full training experiment for the MMGNN model, including feature selection, data splitting, training, and validation.
@@ -436,12 +446,13 @@ def run_experiment(
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
     logger = logging.getLogger(__name__)
 
-    task_type, classification_target_mode, loss_function = _normalize_task_config(
-        task_type=task_type,
-        classification_target_mode=classification_target_mode,
-        loss_function=loss_function,
-        ilr_transform=ilr_transform,
-    )
+    if task_type is not None:
+        task_type, classification_target_mode, loss_function = _normalize_task_config(
+            task_type=task_type,
+            classification_target_mode=classification_target_mode,
+            loss_function=loss_function,
+            ilr_transform=ilr_transform,
+        )
 
     logger.info("Starting experiment with configuration: %s", {
         "conv_type": conv_type,
@@ -639,15 +650,52 @@ def run_experiment(
         jumping_knowledge_mode=jumping_knowledge_mode
     )
     logger.info("Backbone architecture:\n%s", backbone)
-    model = MMGNN(
-        backbone=backbone,
-        out_dim=out_dim,
-        hidden_dim=hidden_dim,
-        readout_type=readout_type,
-        num_layers=num_layers,
-        activation=act_func,
-        dropout=dropout
-    ).to(device)
+    if model_type.lower() == "mmgnn":
+        model = MMGNN(
+            backbone=backbone,
+            out_dim=out_dim,
+            hidden_dim=hidden_dim,
+            readout_type=readout_type,
+            num_layers=num_layers,
+            activation=act_func,
+            dropout=dropout,
+        ).to(device)
+    elif model_type.lower() == "gae":
+        # Build Encoder matching backbone config
+        encoder = Encoder(
+            num_node_features=num_node_features,
+            num_edge_features=num_edge_features,
+            hidden_dim=hidden_dim,
+            num_heads=num_heads if conv_type == "gat" else None,
+            num_layers=num_layers,
+            conv_type=conv_type,
+            act_func=act_func,
+            norm_type=norm_type,
+            dropout=dropout,
+            edge_dropout=edge_dropout,
+            residual=residual,
+        )
+
+        edge_decoder_type = "mlp" if num_edge_features and num_edge_features > 0 else "inner_product"
+        if edge_decoder_type == "mlp":
+            recon_edge_presence_weight = 0.0
+            if recon_edge_attr_weight <= 0:
+                recon_edge_attr_weight = 1.0
+        else:
+            if recon_edge_presence_weight <= 0:
+                recon_edge_presence_weight = 1.0
+
+        model = GAE(
+            encoder=encoder,
+            edge_decoder_type=edge_decoder_type,
+            edge_out_dim=None,
+            decode_node_features=True,
+            node_out_dim=num_node_features,
+            decoder_hidden_dim=None,
+            dropout=dropout,
+        ).to(device)
+    else:
+        raise ValueError("model_type must be one of: 'mmgnn', 'gae'")
 
     if pretrained_weights_path is not None:
         _load_pretrained_weights(
@@ -746,7 +794,14 @@ def run_experiment(
         weight_decay=weight_decay,
         optimizer_param_groups=optimizer_param_groups,
         checkpoint_dir=checkpoint_dir,
-        device=device
+        device=device,
+        training_mode=("gae_reconstruction" if model_type.lower() == "gae" else "supervised"),
+        neg_sampling_ratio=neg_sampling_ratio,
+        recon_edge_presence_weight=recon_edge_presence_weight,
+        recon_node_attr_weight=recon_node_attr_weight,
+        recon_edge_attr_weight=recon_edge_attr_weight,
+        recon_node_loss_type=recon_node_loss_type,
+        recon_edge_attr_loss_type=recon_edge_attr_loss_type,
     )
 
     # Step 6: Run Training
@@ -814,6 +869,14 @@ def run_experiment(
             val_results["accuracy"],
             val_results["f1"],
         )
+    elif val_results is not None and model_type.lower() == "gae":
+        logger.info(
+            "Validation reconstruction: loss=%.4f, edge_presence=%.4f, node_attr=%.4f, edge_attr=%.4f",
+            val_results["loss"],
+            val_results.get("edge_presence_loss", float("nan")),
+            val_results.get("node_attr_loss", float("nan")),
+            val_results.get("edge_attr_loss", float("nan")),
+        )
     elif val_results is not None:
         logger.info(
             "Validation results: mae=%.4f, pearson=%.4f",
@@ -842,6 +905,14 @@ def run_experiment(
             test_results["accuracy"],
             test_results["f1"],
         )
+    elif test_results is not None and model_type.lower() == "gae":
+        logger.info(
+            "Test reconstruction: loss=%.4f, edge_presence=%.4f, node_attr=%.4f, edge_attr=%.4f",
+            test_results["loss"],
+            test_results.get("edge_presence_loss", float("nan")),
+            test_results.get("node_attr_loss", float("nan")),
+            test_results.get("edge_attr_loss", float("nan")),
+        )
     elif test_results is not None:
         logger.info(
             "Test results: mae=%.4f, pearson=%.4f",
@@ -867,14 +938,212 @@ def run_experiment(
 
     return {
         "model": model,
+        "trainer": trainer,
         "train_loader": train_loader,
         "val_loader": val_loader,
         "test_loader": test_loader,
         "normalizer": normalizer,
         "best_epoch": trainer.best_epoch,
         "best_val_loss": trainer.best_val_loss,
+        "best_checkpoint": checkpoint_dir / f"checkpoint_epoch_{trainer.best_epoch}.pt",
+        "last_checkpoint": checkpoint_dir / f"checkpoint_epoch_{num_epochs}.pt",
         "history": trainer.history,
         "checkpoint_dir": checkpoint_dir,
         "val_results": val_results,
         "test_results": test_results
+    }
+
+
+def evaluate_saved_gae_checkpoint(
+    dataset,
+    checkpoint_path: Path,
+    conv_type: str,
+    hidden_dim: int,
+    num_layers: int,
+    act_func: str,
+    norm_type: str,
+    dropout: float,
+    edge_dropout: float,
+    residual: bool,
+    train_subjects: str,
+    val_subjects: str = None,
+    test_subjects: str = None,
+    node_feature_keys: Optional[list] = None,
+    edge_feature_keys: Optional[list] = None,
+    target_keys: Optional[list] = None,
+    add_virtual_node: bool = False,
+    add_node_type_feature: bool = True,
+    virtual_edge_strategy: str = "zeros",
+    normalize_data: bool = True,
+    normalize_nodes: bool = True,
+    normalize_edges: bool = True,
+    normalize_edge_weights: bool = True,
+    batch_size: int = 32,
+    num_heads: int = 4,
+    checkpoint_dir: Path = None,
+    device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+    neg_sampling_ratio: float = 1.0,
+    recon_edge_presence_weight: float = 1.0,
+    recon_node_attr_weight: float = 1.0,
+    recon_edge_attr_weight: float = 1.0,
+    recon_node_loss_type: str = "mse",
+    recon_edge_attr_loss_type: str = "mse",
+    verbose: bool = True,
+) -> Dict[str, Any]:
+    """Load a saved GAE checkpoint and evaluate it on the held-out test split without retraining."""
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+    logger = logging.getLogger(__name__)
+
+    checkpoint_path = Path(checkpoint_path)
+    if checkpoint_dir is None:
+        checkpoint_dir = checkpoint_path.parent
+    else:
+        checkpoint_dir = Path(checkpoint_dir)
+
+    feature_selector = FeatureSelector(
+        dataset=dataset,
+        node_feature_keys=node_feature_keys,
+        edge_feature_keys=edge_feature_keys,
+        target_keys=target_keys,
+    )
+    dataset = feature_selector.subset_dataset()
+
+    data_splitter = DataSplitter(
+        dataset=dataset,
+        train_subjects=train_subjects,
+        val_subjects=val_subjects,
+        test_subjects=test_subjects,
+    )
+    train_indices, val_indices, test_indices = data_splitter.get_split_indices()
+
+    train_data = [dataset[i].clone() for i in train_indices.values()]
+    val_data = [dataset[i].clone() for i in val_indices.values()] if val_indices is not None and len(val_indices) > 0 else None
+    test_data = [dataset[i].clone() for i in test_indices.values()] if test_indices is not None and len(test_indices) > 0 else None
+
+    normalizer = None
+    if normalize_data:
+        normalizer_path = checkpoint_dir / "normalization_stats.json"
+        normalizer = NormalizationStats.load(normalizer_path)
+        train_data = [normalizer.transform(data) for data in train_data]
+        if val_data is not None:
+            val_data = [normalizer.transform(data) for data in val_data]
+        if test_data is not None:
+            test_data = [normalizer.transform(data) for data in test_data]
+
+    train_loader = DataLoader(train_data, batch_size=batch_size, shuffle=False)
+    val_loader = DataLoader(val_data, batch_size=batch_size, shuffle=False) if val_data is not None else None
+    test_loader = DataLoader(test_data, batch_size=batch_size, shuffle=False) if test_data is not None else None
+
+    sample_graph = train_data[0] if len(train_data) > 0 else test_data[0]
+    num_node_features = sample_graph.x.size(-1)
+    sample_edge_attr = getattr(sample_graph, "edge_attr", None)
+    num_edge_features = sample_edge_attr.size(-1) if sample_edge_attr is not None else 0
+
+    encoder = Encoder(
+        num_node_features=num_node_features,
+        num_edge_features=num_edge_features,
+        hidden_dim=hidden_dim,
+        num_heads=num_heads if conv_type == "gat" else None,
+        num_layers=num_layers,
+        conv_type=conv_type,
+        act_func=act_func,
+        norm_type=norm_type,
+        dropout=dropout,
+        edge_dropout=edge_dropout,
+        residual=residual,
+    )
+
+    edge_decoder_type = "mlp" if num_edge_features and num_edge_features > 0 else "inner_product"
+    model = GAE(
+        encoder=encoder,
+        edge_decoder_type=edge_decoder_type,
+        edge_out_dim=None,
+        decode_node_features=True,
+        node_out_dim=num_node_features,
+        decoder_hidden_dim=None,
+        dropout=dropout,
+    ).to(device)
+
+    trainer = Trainer(
+        model=model,
+        task_type=None,
+        train_loader=train_loader,
+        val_loader=val_loader if val_loader is not None else train_loader,
+        optimizer=torch.optim.AdamW,
+        scheduler=None,
+        criterion=LossSelector("mse"),
+        patience=1,
+        delta=0.0,
+        learning_rate=1e-3,
+        weight_decay=1e-5,
+        checkpoint_dir=checkpoint_dir,
+        device=device,
+        training_mode="gae_reconstruction",
+        neg_sampling_ratio=neg_sampling_ratio,
+        recon_edge_presence_weight=recon_edge_presence_weight,
+        recon_node_attr_weight=recon_node_attr_weight,
+        recon_edge_attr_weight=recon_edge_attr_weight,
+        recon_node_loss_type=recon_node_loss_type,
+        recon_edge_attr_loss_type=recon_edge_attr_loss_type,
+    )
+
+    trainer.load_checkpoint(checkpoint_path)
+
+    train_results = trainer.evaluate(train_loader)
+    val_results = trainer.evaluate(val_loader) if val_loader is not None else None
+    test_results = trainer.evaluate(test_loader) if test_loader is not None else None
+
+    # Get embeddings for validation set and test set.
+    train_embeddings, train_targets = trainer.get_embeddings(train_loader)
+    if val_loader is not None:
+        val_embeddings, val_targets = trainer.get_embeddings(val_loader)
+        if verbose:
+            logger.info("Extracted embeddings for validation set with shape: %s", val_embeddings.shape)
+    if test_loader is not None:
+        test_embeddings, test_targets = trainer.get_embeddings(test_loader)
+        if verbose:
+            logger.info("Extracted embeddings for test set with shape: %s", test_embeddings.shape)
+
+    logger.info(
+        "Train reconstruction: loss=%.4f, edge_presence=%.4f, node_attr=%.4f, edge_attr=%.4f",
+        train_results["loss"],
+        train_results.get("edge_presence_loss", float("nan")),
+        train_results.get("node_attr_loss", float("nan")),
+        train_results.get("edge_attr_loss", float("nan")),
+    )
+    if verbose and val_results is not None:
+        logger.info(
+            "Validation reconstruction: loss=%.4f, edge_presence=%.4f, node_attr=%.4f, edge_attr=%.4f",
+            val_results["loss"],
+            val_results.get("edge_presence_loss", float("nan")),
+            val_results.get("node_attr_loss", float("nan")),
+            val_results.get("edge_attr_loss", float("nan")),
+        )
+    if verbose and test_results is not None:
+        logger.info(
+            "Test reconstruction: loss=%.4f, edge_presence=%.4f, node_attr=%.4f, edge_attr=%.4f",
+            test_results["loss"],
+            test_results.get("edge_presence_loss", float("nan")),
+            test_results.get("node_attr_loss", float("nan")),
+            test_results.get("edge_attr_loss", float("nan")),
+        )
+
+    return {
+        "model": model,
+        "trainer": trainer,
+        "normalizer": normalizer,
+        "train_loader": train_loader,
+        "val_loader": val_loader,
+        "test_loader": test_loader,
+        "checkpoint_path": checkpoint_path,
+        "checkpoint_dir": checkpoint_dir,
+        "train_results": train_results,
+        "val_results": val_results,
+        "test_results": test_results,
+        "train_embeddings": train_embeddings,
+        "train_targets": train_targets,
+        "val_embeddings": val_embeddings if val_loader is not None else None,
+        "val_targets": val_targets if val_loader is not None else None,
+        "test_embeddings": test_embeddings if test_loader is not None else None,
+        "test_targets": test_targets if test_loader is not None else None,
     }

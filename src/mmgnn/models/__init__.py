@@ -4,6 +4,7 @@ from .blocks import GraphConvBlock, add_act_func, add_norm_layer, add_readout, a
 from .backbone import GNN
 from .mmgnn import MMGNN, prediction_head
 from .modules import GINEConvEdgeMLP
+from .gae import GAE, Encoder, InnerProductEdgeDecoder, EdgeMLPDecoder, NodeMLPDecoder
 
 __all__ = [
     "GraphConvBlock",
@@ -14,5 +15,10 @@ __all__ = [
     "GNN",
     "MMGNN",
     "prediction_head",
-    "GINEConvEdgeMLP"
+    "GINEConvEdgeMLP",
+    "GAE",
+    "Encoder",
+    "InnerProductEdgeDecoder",
+    "EdgeMLPDecoder",
+    "NodeMLPDecoder",
 ]

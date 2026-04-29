@@ -11,6 +11,7 @@ import torch
 import torch.nn as nn
 from torch.optim import Adam
 from torch_geometric.loader import DataLoader
+from torch_geometric.utils import negative_sampling
 from scipy import stats
 
 
@@ -58,10 +59,17 @@ class Trainer:
                  weight_decay: float = 1e-5,
                  optimizer_param_groups: Optional[list[dict]] = None,
                  checkpoint_dir: Path = Path("./checkpoints"),
-                 device: torch.device = None):
+                 device: torch.device = None,
+                 training_mode: str = "supervised",
+                 neg_sampling_ratio: float = 1.0,
+                 recon_edge_presence_weight: float = 1.0,
+                 recon_node_attr_weight: float = 1.0,
+                 recon_edge_attr_weight: float = 1.0,
+                 recon_node_loss_type: str = "mse",
+                 recon_edge_attr_loss_type: str = "mse"):
 
-        self.task_type = task_type.lower()
-        if self.task_type not in {"regression", "classification"}:
+        self.task_type = task_type.lower() if task_type is not None else None
+        if self.task_type not in {"regression", "classification"} and self.task_type is not None:
             raise ValueError("task_type must be either 'regression' or 'classification'")
 
         self.train_loader = train_loader
@@ -69,6 +77,17 @@ class Trainer:
         self.criterion = criterion
         self.device = device
         self.checkpoint_dir = checkpoint_dir
+        self.training_mode = training_mode.lower()
+        if self.training_mode not in {"supervised", "gae_reconstruction"}:
+            raise ValueError("training_mode must be either 'supervised' or 'gae_reconstruction'")
+
+        # Reconstruction training config
+        self.neg_sampling_ratio = float(neg_sampling_ratio)
+        self.recon_edge_presence_weight = float(recon_edge_presence_weight)
+        self.recon_node_attr_weight = float(recon_node_attr_weight)
+        self.recon_edge_attr_weight = float(recon_edge_attr_weight)
+        self.recon_node_loss_type = recon_node_loss_type
+        self.recon_edge_attr_loss_type = recon_edge_attr_loss_type
 
         if device is None:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -107,11 +126,17 @@ class Trainer:
             "train_pearson": [],
             "train_accuracy": [],
             "train_f1": [],
+            "train_edge_presence_loss": [],
+            "train_node_attr_loss": [],
+            "train_edge_attr_loss": [],
             "val_loss": [],
             "val_mae": [],
             "val_pearson": [],
             "val_accuracy": [],
             "val_f1": [],
+            "val_edge_presence_loss": [],
+            "val_node_attr_loss": [],
+            "val_edge_attr_loss": [],
             "lr": []
         }
         self.best_val_loss = float("inf")
@@ -183,29 +208,89 @@ class Trainer:
         self.model.train() if training else self.model.eval()
         total_loss, total_samples = 0.0, 0
         all_preds, all_targets = [], []
+        # Accumulators for reconstruction components (if using GAE mode)
+        total_edge_presence_loss = 0.0
+        total_node_attr_loss = 0.0
+        total_edge_attr_loss = 0.0
 
         with torch.set_grad_enabled(training):
             for batch in loader:
                 batch = batch.to(self.device)
-                out = self.model(batch)
-                loss = self.loss(out, batch.y)
 
-                if training:
-                    self.optimizer.zero_grad()
-                    loss.backward()
-                    # Gradient clipping
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=5.0)
-                    self.optimizer.step()
+                if self.training_mode == "supervised":
+                    out = self.model(batch)
+                    loss = self.loss(out, batch.y)
 
-                total_loss += loss.item() * batch.num_graphs
-                total_samples += batch.num_graphs
+                    if training:
+                        self.optimizer.zero_grad()
+                        loss.backward()
+                        # Gradient clipping
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=5.0)
+                        self.optimizer.step()
 
-                all_preds.append(out.cpu())
-                all_targets.append(batch.y.cpu())
+                    total_loss += loss.item() * batch.num_graphs
+                    total_samples += batch.num_graphs
+
+                    all_preds.append(out.cpu())
+                    all_targets.append(batch.y.cpu())
+
+                else:
+                    # GAE reconstruction training path
+                    # Encode to latent space
+                    z = None
+                    if hasattr(self.model, "encode"):
+                        z = self.model.encode(batch.x, batch.edge_index, edge_attr=getattr(batch, "edge_attr", None), batch=getattr(batch, "batch", None))
+                    else:
+                        # Assume the model.forward returns dict with 'z'
+                        out = self.model(batch)
+                        z = out.get("z") if isinstance(out, dict) else None
+
+                    if z is None:
+                        raise RuntimeError("Model does not expose an encoder 'encode' method or return 'z' in forward().")
+
+                    # Positive edges are batch.edge_index
+                    pos_ei = batch.edge_index
+                    num_pos = pos_ei.size(1)
+                    num_neg = int(num_pos * max(1.0, self.neg_sampling_ratio))
+                    neg_ei = negative_sampling(edge_index=pos_ei, num_nodes=batch.num_nodes, num_neg_samples=num_neg)
+
+                    components = self.model.recon_total_loss(
+                        z=z,
+                        pos_edge_index=pos_ei,
+                        neg_edge_index=neg_ei,
+                        target_x=getattr(batch, "x", None),
+                        edge_index_for_attr=pos_ei,
+                        target_edge_attr=getattr(batch, "edge_attr", None),
+                        edge_presence_weight=self.recon_edge_presence_weight,
+                        node_attr_weight=self.recon_node_attr_weight,
+                        edge_attr_weight=self.recon_edge_attr_weight,
+                        node_loss_type=self.recon_node_loss_type,
+                        edge_attr_loss_type=self.recon_edge_attr_loss_type,
+                    )
+
+                    batch_total_loss = components["total_loss"]
+                    if training:
+                        self.optimizer.zero_grad()
+                        batch_total_loss.backward()
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=5.0)
+                        self.optimizer.step()
+
+                    total_loss += batch_total_loss.item() * batch.num_graphs
+                    total_samples += batch.num_graphs
+
+                    # accumulate component-wise losses if present
+                    total_edge_presence_loss += components.get("edge_presence_loss", torch.tensor(0.0)).item() * batch.num_graphs
+                    total_node_attr_loss += components.get("node_attr_loss", torch.tensor(0.0)).item() * batch.num_graphs
+                    total_edge_attr_loss += components.get("edge_attr_loss", torch.tensor(0.0)).item() * batch.num_graphs
 
         average_loss = total_loss / max(1, total_samples)
-        preds = torch.cat(all_preds).detach()
-        targets = torch.cat(all_targets).detach()
+        preds = torch.cat(all_preds).detach() if len(all_preds) > 0 else torch.tensor([])
+        targets = torch.cat(all_targets).detach() if len(all_targets) > 0 else torch.tensor([])
+
+        # Average component-wise reconstruction losses
+        avg_edge_presence_loss = total_edge_presence_loss / max(1, total_samples)
+        avg_node_attr_loss = total_node_attr_loss / max(1, total_samples)
+        avg_edge_attr_loss = total_edge_attr_loss / max(1, total_samples)
 
         if self.task_type == "classification":
             cls_metrics = self._classification_metrics(preds, targets)
@@ -216,12 +301,15 @@ class Trainer:
                 "pearson": float("nan"),
                 "accuracy": cls_metrics["accuracy"],
                 "f1": cls_metrics["f1"],
+                "edge_presence_loss": avg_edge_presence_loss,
+                "node_attr_loss": avg_node_attr_loss,
+                "edge_attr_loss": avg_edge_attr_loss,
             }
 
-        preds_np = preds.numpy()
-        targets_np = targets.numpy()
-        average_mae = float(np.mean(np.abs(preds_np - targets_np)))
-        pearson_corr = self._safe_pearson(preds_np, targets_np)
+        preds_np = preds.numpy() if preds.numel() > 0 else np.array([])
+        targets_np = targets.numpy() if targets.numel() > 0 else np.array([])
+        average_mae = float(np.mean(np.abs(preds_np - targets_np))) if preds_np.size and targets_np.size else float("nan")
+        pearson_corr = self._safe_pearson(preds_np, targets_np) if preds_np.size and targets_np.size else float("nan")
         return {
             "lr": self.optimizer.param_groups[0]['lr'],
             "loss": average_loss,
@@ -229,6 +317,9 @@ class Trainer:
             "pearson": pearson_corr,
             "accuracy": float("nan"),
             "f1": float("nan"),
+            "edge_presence_loss": avg_edge_presence_loss,
+            "node_attr_loss": avg_node_attr_loss,
+            "edge_attr_loss": avg_edge_attr_loss,
         }
 
     def _run_validation(self, loader: DataLoader) -> Dict[str, float]:
@@ -255,11 +346,18 @@ class Trainer:
             self.history["train_pearson"].append(train_metrics["pearson"])
             self.history["train_accuracy"].append(train_metrics["accuracy"])
             self.history["train_f1"].append(train_metrics["f1"])
+            # Reconstruction components (may be nan if supervised)
+            self.history["train_edge_presence_loss"].append(train_metrics.get("edge_presence_loss", float("nan")))
+            self.history["train_node_attr_loss"].append(train_metrics.get("node_attr_loss", float("nan")))
+            self.history["train_edge_attr_loss"].append(train_metrics.get("edge_attr_loss", float("nan")))
             self.history["val_loss"].append(val_metrics["loss"])
             self.history["val_mae"].append(val_metrics["mae"])
             self.history["val_pearson"].append(val_metrics["pearson"])
             self.history["val_accuracy"].append(val_metrics["accuracy"])
             self.history["val_f1"].append(val_metrics["f1"])
+            self.history["val_edge_presence_loss"].append(val_metrics.get("edge_presence_loss", float("nan")))
+            self.history["val_node_attr_loss"].append(val_metrics.get("node_attr_loss", float("nan")))
+            self.history["val_edge_attr_loss"].append(val_metrics.get("edge_attr_loss", float("nan")))
             self.history["lr"].append(self.optimizer.param_groups[0]['lr'])
 
             # Check for improvement
@@ -304,6 +402,69 @@ class Trainer:
     def evaluate(self, loader: DataLoader) -> Dict[str, float]:
         """Evaluates the model on a given data loader."""
         self.model.eval()
+
+        if self.training_mode == "gae_reconstruction":
+            total_loss, total_samples = 0.0, 0
+            total_edge_presence_loss = 0.0
+            total_node_attr_loss = 0.0
+            total_edge_attr_loss = 0.0
+
+            with torch.no_grad():
+                for batch in loader:
+                    batch = batch.to(self.device, non_blocking=True)
+
+                    if hasattr(self.model, "encode"):
+                        z = self.model.encode(
+                            batch.x,
+                            batch.edge_index,
+                            edge_attr=getattr(batch, "edge_attr", None),
+                            batch=getattr(batch, "batch", None),
+                        )
+                    else:
+                        out = self.model(batch)
+                        z = out.get("z") if isinstance(out, dict) else None
+
+                    if z is None:
+                        raise RuntimeError("Model does not expose an encoder 'encode' method or return 'z' in forward().")
+
+                    pos_ei = batch.edge_index
+                    num_pos = pos_ei.size(1)
+                    num_neg = int(num_pos * max(1.0, self.neg_sampling_ratio))
+                    neg_ei = negative_sampling(edge_index=pos_ei, num_nodes=batch.num_nodes, num_neg_samples=num_neg)
+
+                    components = self.model.recon_total_loss(
+                        z=z,
+                        pos_edge_index=pos_ei,
+                        neg_edge_index=neg_ei,
+                        target_x=getattr(batch, "x", None),
+                        edge_index_for_attr=pos_ei,
+                        target_edge_attr=getattr(batch, "edge_attr", None),
+                        edge_presence_weight=self.recon_edge_presence_weight,
+                        node_attr_weight=self.recon_node_attr_weight,
+                        edge_attr_weight=self.recon_edge_attr_weight,
+                        node_loss_type=self.recon_node_loss_type,
+                        edge_attr_loss_type=self.recon_edge_attr_loss_type,
+                    )
+
+                    batch_loss = components["total_loss"]
+                    total_loss += batch_loss.item() * batch.num_graphs
+                    total_samples += batch.num_graphs
+                    total_edge_presence_loss += components.get("edge_presence_loss", torch.tensor(0.0)).item() * batch.num_graphs
+                    total_node_attr_loss += components.get("node_attr_loss", torch.tensor(0.0)).item() * batch.num_graphs
+                    total_edge_attr_loss += components.get("edge_attr_loss", torch.tensor(0.0)).item() * batch.num_graphs
+
+            average_loss = total_loss / max(1, total_samples)
+            return {
+                "loss": average_loss,
+                "mae": float("nan"),
+                "pearson": float("nan"),
+                "accuracy": float("nan"),
+                "f1": float("nan"),
+                "edge_presence_loss": total_edge_presence_loss / max(1, total_samples),
+                "node_attr_loss": total_node_attr_loss / max(1, total_samples),
+                "edge_attr_loss": total_edge_attr_loss / max(1, total_samples),
+            }
+
         all_preds, all_targets = [], []
 
         with torch.no_grad():
