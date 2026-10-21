@@ -1,32 +1,28 @@
 """
-Plotting functions for training and evaluation metrics in the mmgnn framework.
-Includes functions to visualize training/validation loss, MAE, and Pearson correlation over epochs.
+Plotting functions for GAE training and evaluation.
 """
 
 from pathlib import Path
-import os
-import shutil
-
+import logging
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.manifold import TSNE
-import torch
-import torchlens as tl
-from torch_geometric.data import Data
 
 
 def plot_training_history(history: dict, save_path: str = None, best_epoch: int = None):
     """
-    Plots the training history of loss, MAE, and Pearson correlation over epochs.
-    
-    Args:
-        history (dict): A dictionary containing lists of training and validation metrics per epoch.
-        save_path (str, optional): If provided, saves the plot to the specified path.
-        best_epoch (int, optional): If provided, highlights the best epoch on the plots.
-    """
+    Plot GAE training history: total loss and reconstruction component losses.
 
+    Args:
+        history: Dictionary containing per-epoch train/val metrics.
+        save_path: Optional path to save the figure.
+        best_epoch: Optional epoch to highlight on the plots.
+    """
     num_epochs = len(history.get("train_loss", []))
+    if num_epochs == 0:
+        raise ValueError("history does not contain any training epochs to plot")
+
     epochs = range(1, num_epochs + 1)
 
     def _series(key: str) -> np.ndarray:
@@ -39,301 +35,129 @@ def plot_training_history(history: dict, save_path: str = None, best_epoch: int 
             arr = arr[:num_epochs]
         return arr
 
-    train_loss = _series("train_loss")
+    loss_panels = [
+        {
+            "title": "Total Reconstruction Loss",
+            "series": [
+                ("Train", _series("train_loss")),
+                ("Val", _series("val_loss")),
+            ],
+            "mark_best": True,
+        },
+        {
+            "title": "Edge Presence Loss",
+            "series": [
+                ("Train", _series("train_edge_presence_loss")),
+                ("Val", _series("val_edge_presence_loss")),
+            ],
+            "mark_best": False,
+        },
+        {
+            "title": "Node Attribute Loss",
+            "series": [
+                ("Train", _series("train_node_attr_loss")),
+                ("Val", _series("val_node_attr_loss")),
+            ],
+            "mark_best": False,
+        },
+        {
+            "title": "Edge Attribute Loss",
+            "series": [
+                ("Train", _series("train_edge_attr_loss")),
+                ("Val", _series("val_edge_attr_loss")),
+            ],
+            "mark_best": False,
+        },
+    ]
+
+    active_panels = [
+        panel
+        for panel in loss_panels
+        if any(np.isfinite(values).any() for _, values in panel["series"])
+    ]
+    if not active_panels:
+        raise ValueError("history does not contain any finite GAE reconstruction losses to plot")
+
+    n_cols = min(2, len(active_panels))
+    n_rows = (len(active_panels) + n_cols - 1) // n_cols
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(7 * n_cols, 5 * n_rows))
+    axes = np.atleast_1d(axes).flatten()
+
     val_loss = _series("val_loss")
-    train_mae = _series("train_mae")
-    val_mae = _series("val_mae")
-    train_pearson = _series("train_pearson")
-    val_pearson = _series("val_pearson")
-    train_accuracy = _series("train_accuracy")
-    val_accuracy = _series("val_accuracy")
-    train_f1 = _series("train_f1")
-    val_f1 = _series("val_f1")
+    for ax, panel in zip(axes, active_panels):
+        for label, values in panel["series"]:
+            if np.isfinite(values).any():
+                ax.plot(epochs, values, label=label)
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("Loss")
+        ax.set_title(panel["title"])
+        if panel["mark_best"] and best_epoch is not None and 1 <= best_epoch <= num_epochs:
+            if np.isfinite(val_loss[best_epoch - 1]):
+                ax.scatter(
+                    best_epoch,
+                    val_loss[best_epoch - 1],
+                    color="red",
+                    s=100,
+                    edgecolors="black",
+                    label=f"Best Epoch: {best_epoch}",
+                )
+        ax.legend()
+        ax.grid(True, alpha=0.25, linestyle="--")
 
-    has_classification_metrics = (
-        np.isfinite(train_accuracy).any()
-        or np.isfinite(val_accuracy).any()
-        or np.isfinite(train_f1).any()
-        or np.isfinite(val_f1).any()
+    for ax in axes[len(active_panels):]:
+        ax.axis("off")
+
+    fig.tight_layout()
+
+    if save_path is not None:
+        save_file = Path(save_path)
+        save_file.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(save_file, dpi=300, bbox_inches="tight")
+        plt.close(fig)
+
+
+def _compute_embedding_tsne(
+    embeddings: np.ndarray,
+    *,
+    perplexity: float,
+    random_state: int,
+    max_iter: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    emb = np.asarray(embeddings, dtype=float)
+    if emb.ndim == 1:
+        emb = emb.reshape(-1, 1)
+    elif emb.ndim > 2:
+        emb = emb.reshape(emb.shape[0], -1)
+
+    finite_embedding_mask = np.isfinite(emb).all(axis=1)
+    emb = emb[finite_embedding_mask]
+
+    if emb.shape[0] < 2:
+        raise ValueError("need at least 2 finite embedding rows to compute t-SNE")
+    if perplexity <= 0:
+        raise ValueError("perplexity must be > 0")
+    if perplexity >= emb.shape[0]:
+        raise ValueError(
+            f"perplexity ({perplexity}) must be smaller than the number of samples ({emb.shape[0]})"
+        )
+
+    if emb.shape[0] > 1000:
+        sample_indices = np.random.RandomState(seed=random_state).choice(emb.shape[0], size=1000, replace=False)
+        emb = emb[sample_indices]
+    else:
+        sample_indices = np.arange(emb.shape[0])
+
+    reducer = TSNE(
+        n_components=2,
+        perplexity=perplexity,
+        random_state=random_state,
+        max_iter=max_iter,
+        init="pca",
+        learning_rate="auto",
+        verbose=0,
     )
-
-    plt.figure(figsize=(15, 5))
-
-    # Plot Loss
-    plt.subplot(1, 3, 1)
-    plt.plot(epochs, train_loss, label="Train Loss")
-    plt.plot(epochs, val_loss, label="Val Loss")
-    plt.xlabel("Epoch")
-    plt.ylabel("Loss")
-    plt.title("Training and Validation Loss")
-    if best_epoch is not None:
-        # Circle the best epoch on the loss plot
-        if 1 <= best_epoch <= num_epochs and np.isfinite(val_loss[best_epoch - 1]):
-            plt.scatter(best_epoch, val_loss[best_epoch - 1], color='red', s=100, edgecolors='black', label=f'Best Epoch: {best_epoch}')
-    plt.legend()
-
-    # Plot MAE or Accuracy
-    plt.subplot(1, 3, 2)
-    if has_classification_metrics:
-        plt.plot(epochs, train_accuracy, label="Train Accuracy")
-        plt.plot(epochs, val_accuracy, label="Val Accuracy")
-    else:
-        plt.plot(epochs, train_mae, label="Train MAE")
-        plt.plot(epochs, val_mae, label="Val MAE")
-    plt.xlabel("Epoch")
-    if has_classification_metrics:
-        plt.ylabel("Accuracy")
-        plt.title("Training and Validation Accuracy")
-    else:
-        plt.ylabel("MAE")
-        plt.title("Training and Validation MAE")
-    if best_epoch is not None:
-        if 1 <= best_epoch <= num_epochs:
-            marker_value = val_accuracy[best_epoch - 1] if has_classification_metrics else val_mae[best_epoch - 1]
-            if np.isfinite(marker_value):
-                plt.scatter(best_epoch, marker_value, color='red', s=100, edgecolors='black', label=f'Best Epoch: {best_epoch}')
-    plt.legend()
-
-    # Plot Pearson or F1
-    plt.subplot(1, 3, 3)
-    if has_classification_metrics:
-        plt.plot(epochs, train_f1, label="Train F1")
-        plt.plot(epochs, val_f1, label="Val F1")
-    else:
-        plt.plot(epochs, train_pearson, label="Train Pearson")
-        plt.plot(epochs, val_pearson, label="Val Pearson")
-    plt.xlabel("Epoch")
-    if has_classification_metrics:
-        plt.ylabel("Macro F1")
-        plt.title("Training and Validation F1")
-    else:
-        plt.ylabel("Pearson Correlation")
-        plt.title("Training and Validation Pearson Correlation")
-    if best_epoch is not None:
-        if 1 <= best_epoch <= num_epochs:
-            marker_value = val_f1[best_epoch - 1] if has_classification_metrics else val_pearson[best_epoch - 1]
-            if np.isfinite(marker_value):
-                plt.scatter(best_epoch, marker_value, color='red', s=100, edgecolors='black', label=f'Best Epoch: {best_epoch}')
-    plt.legend()
-
-    plt.tight_layout()
-    
-    if save_path is not None:
-        plt.savefig(save_path)
-    
-    plt.show()
-
-
-def plot_predictions(preds: np.ndarray, targets: np.ndarray, save_path: str = None):
-    """
-    Plots predicted vs. true values for a regression task.
-    
-    Args:
-        preds (np.ndarray): An array of predicted values.
-        targets (np.ndarray): An array of true target values.
-        save_path (str, optional): If provided, saves the plot to the specified path.
-    """
-
-    preds = np.asarray(preds)
-    targets = np.asarray(targets)
-
-    # Ensure 2D arrays: [N, D]
-    if preds.ndim == 1:
-        preds = preds.reshape(-1, 1)
-    elif preds.ndim > 2:
-        preds = preds.reshape(preds.shape[0], -1)
-
-    if targets.ndim == 1:
-        targets = targets.reshape(-1, 1)
-    elif targets.ndim > 2:
-        targets = targets.reshape(targets.shape[0], -1)
-
-    # Align samples and target dimensions to the shared subset.
-    num_samples = min(preds.shape[0], targets.shape[0])
-    num_targets = min(preds.shape[1], targets.shape[1])
-
-    if num_samples == 0 or num_targets == 0:
-        raise ValueError("preds and targets must contain at least one sample and one target dimension")
-
-    if preds.shape != targets.shape:
-        print(
-            "Warning: preds and targets have different shapes; plotting the shared subset "
-            f"[samples={num_samples}, targets={num_targets}]"
-        )
-
-    preds = preds[:num_samples, :num_targets]
-    targets = targets[:num_samples, :num_targets]
-
-    # Detect subplots based on the number of target dimensions
-    fig, axes = plt.subplots(1, num_targets, figsize=(5 * num_targets, 5))
-    if num_targets == 1:
-        axes = [axes]  # Ensure axes is iterable
-
-    for i in range(num_targets):
-        ax = axes[i]
-        ax.scatter(targets[:, i], preds[:, i], alpha=0.5)
-        ax.plot([targets[:, i].min(), targets[:, i].max()], [targets[:, i].min(), targets[:, i].max()], 'r--')
-        ax.set_xlabel("True Values")
-        ax.set_ylabel("Predicted Values")
-        ax.set_title(f"Predicted vs. True Values (Target {i + 1})")
-
-    plt.tight_layout()
-    if save_path is not None:
-        plt.savefig(save_path)
-    plt.show()
-
-
-def plot_classification_probabilities(
-    probabilities: np.ndarray,
-    target_memberships: np.ndarray,
-    save_path: str = None,
-):
-    """
-    Plot predicted class probabilities against target memberships per class.
-
-    This mirrors the regression scatter view but constrains both axes to [0, 1]
-    because values represent probabilities/memberships.
-    """
-    probs = np.asarray(probabilities)
-    targets = np.asarray(target_memberships)
-
-    if probs.ndim == 1:
-        probs = probs.reshape(-1, 1)
-    elif probs.ndim > 2:
-        probs = probs.reshape(probs.shape[0], -1)
-
-    if targets.ndim == 1:
-        targets = targets.reshape(-1, 1)
-    elif targets.ndim > 2:
-        targets = targets.reshape(targets.shape[0], -1)
-
-    num_samples = min(probs.shape[0], targets.shape[0])
-    num_classes = min(probs.shape[1], targets.shape[1])
-
-    if num_samples == 0 or num_classes == 0:
-        raise ValueError("probabilities and target_memberships must contain at least one sample and one class")
-
-    if probs.shape != targets.shape:
-        print(
-            "Warning: probabilities and target_memberships have different shapes; plotting shared subset "
-            f"[samples={num_samples}, classes={num_classes}]"
-        )
-
-    probs = probs[:num_samples, :num_classes]
-    targets = targets[:num_samples, :num_classes]
-
-    fig, axes = plt.subplots(1, num_classes, figsize=(5 * num_classes, 5))
-    if num_classes == 1:
-        axes = [axes]
-
-    for i in range(num_classes):
-        ax = axes[i]
-        ax.scatter(targets[:, i], probs[:, i], alpha=0.5)
-        ax.plot([0.0, 1.0], [0.0, 1.0], "r--")
-        ax.set_xlim(0.0, 1.0)
-        ax.set_ylim(0.0, 1.0)
-        ax.set_xlabel("True Membership")
-        ax.set_ylabel("Predicted Probability")
-        ax.set_title(f"Class {i + 1}: Pred Prob vs True Membership")
-
-    plt.tight_layout()
-    if save_path is not None:
-        plt.savefig(save_path)
-    plt.show()
-
-
-def save_model_graph_torchlens(
-    model: torch.nn.Module,
-    batch: Data,
-    save_path: str = "./model_graph.png",
-    vis_mode: str = "rolled",
-):
-    """
-    Save model graph visualization as PNG using TorchLens.
-
-    Args:
-        model (torch.nn.Module): Model to visualize.
-        batch (torch_geometric.data.Data): Sample graph used to trace the forward pass.
-        save_path (str): Output PNG path.
-        vis_mode (str): TorchLens graph mode ("rolled" or "unrolled").
-
-    Returns:
-        pathlib.Path: Path to the saved PNG file.
-    """
-    save_png = Path(save_path)
-    save_png.parent.mkdir(parents=True, exist_ok=True)
-
-    # Resolve Graphviz binary for notebook/kernel environments with stale PATH.
-    dot_path = shutil.which("dot")
-    if dot_path is None:
-        for candidate in ("/opt/homebrew/bin/dot", "/usr/local/bin/dot"):
-            if Path(candidate).exists():
-                dot_path = candidate
-                dot_dir = str(Path(candidate).parent)
-                current_path = os.environ.get("PATH", "")
-                if dot_dir not in current_path.split(":"):
-                    os.environ["PATH"] = f"{dot_dir}:{current_path}" if current_path else dot_dir
-                break
-
-    if dot_path is not None:
-        os.environ["GRAPHVIZ_DOT"] = dot_path
-
-    # Wrap MMGNN so TorchLens can trace tensor arguments and rebuild Data internally.
-    class _TraceWrapper(torch.nn.Module):
-        def __init__(self, wrapped_model: torch.nn.Module):
-            super().__init__()
-            self.wrapped_model = wrapped_model
-
-        def forward(self, x, edge_index, edge_attr, batch_index):
-            data = Data(x=x, edge_index=edge_index, edge_attr=edge_attr, batch=batch_index)
-            return self.wrapped_model(data)
-
-    model_was_training = model.training
-    model.eval()
-
-    model_device = next(model.parameters()).device
-    x = batch.x.to(model_device)
-    edge_index = batch.edge_index.to(model_device)
-
-    edge_attr = getattr(batch, "edge_attr", None)
-    if edge_attr is None:
-        edge_attr = torch.zeros((edge_index.size(1), 1), dtype=x.dtype, device=model_device)
-    else:
-        edge_attr = edge_attr.to(model_device)
-
-    batch_index = getattr(batch, "batch", None)
-    if batch_index is None:
-        batch_index = torch.zeros(x.size(0), dtype=torch.long, device=model_device)
-    else:
-        batch_index = batch_index.to(model_device)
-
-    trace_model = _TraceWrapper(model).to(model_device).eval()
-
-    vis_mode = vis_mode.lower().strip()
-    if vis_mode not in {"rolled", "unrolled"}:
-        raise ValueError("vis_mode must be 'rolled' or 'unrolled'")
-
-    try:
-        try:
-            tl.show_model_graph(
-                trace_model,
-                (x, edge_index, edge_attr, batch_index),
-                vis_mode=vis_mode,
-                vis_outpath=str(save_png),
-                vis_save_only=True,
-                vis_fileformat="png",
-                vis_direction="bottomup",
-                vis_renderer="graphviz",
-            )
-        except FileNotFoundError as exc:
-            raise RuntimeError(
-                "TorchLens could not find Graphviz 'dot'. Install Graphviz and ensure dot is visible to this "
-                "Python process. On macOS: brew install graphviz, then restart the notebook kernel."
-            ) from exc
-    finally:
-        model.train(model_was_training)
-
-    return save_png
+    embeddings_2d = reducer.fit_transform(emb)
+    return embeddings_2d, sample_indices, finite_embedding_mask
 
 
 def plot_embeddings(
@@ -346,84 +170,80 @@ def plot_embeddings(
     cmap: str = "viridis",
 ):
     """
-    Plot graph-level embeddings in 2D using t-SNE, with points colored by target value.
+    Plot graph-level embeddings in 2D using t-SNE.
+
+    When targets are provided, points are colored by target value. Otherwise a
+    single unlabeled scatter plot is produced.
 
     Args:
-        embeddings (np.ndarray): Embedding matrix, shape [num_samples, embedding_dim].
-        targets (np.ndarray, optional): Target values used for coloring, shape
-            [num_samples] or [num_samples, num_targets].
-        save_path (str, optional): If provided, saves the plot to the specified path.
-        perplexity (float): t-SNE perplexity. Must be > 0 and < number of samples.
-        random_state (int): Random seed for deterministic t-SNE output.
-        max_iter (int): Number of optimization iterations for t-SNE.
-        cmap (str): Matplotlib colormap name for target coloring.
+        embeddings: Embedding matrix, shape [num_samples, embedding_dim].
+        targets: Optional target values for coloring, shape [num_samples] or
+            [num_samples, num_targets].
+        save_path: Optional path to save the plot.
+        perplexity: t-SNE perplexity. Must be > 0 and < number of samples.
+        random_state: Random seed for deterministic t-SNE output.
+        max_iter: Number of optimization iterations for t-SNE.
+        cmap: Matplotlib colormap name for target coloring.
 
     Returns:
         np.ndarray: 2D t-SNE coordinates with shape [num_samples_used, 2].
     """
+    embeddings_2d, sample_indices, finite_embedding_mask = _compute_embedding_tsne(
+        embeddings,
+        perplexity=perplexity,
+        random_state=random_state,
+        max_iter=max_iter,
+    )
+
     if targets is None:
-        raise ValueError("targets must be provided for target-colored embedding plots")
+        fig, ax = plt.subplots(figsize=(7, 6))
+        ax.scatter(
+            embeddings_2d[:, 0],
+            embeddings_2d[:, 1],
+            alpha=0.75,
+            s=45,
+            edgecolors="black",
+            linewidth=0.3,
+        )
+        ax.set_xlabel("t-SNE Component 1")
+        ax.set_ylabel("t-SNE Component 2")
+        ax.set_title(f"Graph Embeddings (n={embeddings_2d.shape[0]})")
+        ax.grid(True, alpha=0.25, linestyle="--")
+        fig.tight_layout()
+
+        if save_path is not None:
+            save_file = Path(save_path)
+            save_file.parent.mkdir(parents=True, exist_ok=True)
+            fig.savefig(save_file, dpi=300, bbox_inches="tight")
+            plt.close(fig)
+
+        return embeddings_2d
 
     emb = np.asarray(embeddings, dtype=float)
-    y = np.asarray(targets, dtype=float)
-
     if emb.ndim == 1:
         emb = emb.reshape(-1, 1)
     elif emb.ndim > 2:
         emb = emb.reshape(emb.shape[0], -1)
 
+    y = np.asarray(targets, dtype=float)
     if y.ndim == 1:
         y = y.reshape(-1, 1)
     elif y.ndim > 2:
         y = y.reshape(y.shape[0], -1)
 
-    num_samples = min(emb.shape[0], y.shape[0])
-    if num_samples < 2:
-        raise ValueError("embeddings and targets must contain at least 2 samples")
-
     if emb.shape[0] != y.shape[0]:
-        print(
+        num_samples = min(emb.shape[0], y.shape[0])
+        logging.warning(
             "Warning: embeddings and targets have different numbers of samples; plotting the shared subset "
             f"[samples={num_samples}]"
         )
+        emb = emb[:num_samples]
+        y = y[:num_samples]
 
-    emb = emb[:num_samples]
-    y = y[:num_samples]
+    if y.shape[0] < 2:
+        raise ValueError("embeddings and targets must contain at least 2 samples")
 
-    # Remove rows where embedding coordinates are not finite before running t-SNE.
-    finite_embedding_mask = np.isfinite(emb).all(axis=1)
-    emb = emb[finite_embedding_mask]
-    y = y[finite_embedding_mask]
-
-    if emb.shape[0] < 2:
-        raise ValueError("need at least 2 finite embedding rows to compute t-SNE")
-
-    if perplexity <= 0:
-        raise ValueError("perplexity must be > 0")
-    if perplexity >= emb.shape[0]:
-        raise ValueError(
-            f"perplexity ({perplexity}) must be smaller than the number of samples ({emb.shape[0]})"
-        )
-
-    reducer = TSNE(
-        n_components=2,
-        perplexity=perplexity,
-        random_state=random_state,
-        max_iter=max_iter,
-        init="pca",
-        learning_rate="auto",
-        verbose=0,
-    )
-    # Subsample to 1000 samples if more than 1000 to speed up t-SNE and avoid overcrowded plots.
-    if emb.shape[0] > 1000:
-        sample_indices = np.random.RandomState(seed=random_state).choice(emb.shape[0], size=1000, replace=False)
-        emb = emb[sample_indices]
-        y = y[sample_indices]
-    else:
-        sample_indices = np.arange(emb.shape[0])
-        emb = emb[sample_indices]
-        y = y[sample_indices]
-    embeddings_2d = reducer.fit_transform(emb)
+    y = y[finite_embedding_mask][sample_indices]
 
     num_targets = y.shape[1]
     n_cols = min(3, num_targets)
@@ -463,15 +283,43 @@ def plot_embeddings(
         axes[idx].axis("off")
 
     fig.suptitle("Graph Embeddings Colored by Target Values", fontsize=14, fontweight="bold")
-    plt.tight_layout(rect=[0, 0, 1, 0.98])
+    fig.tight_layout(rect=[0, 0, 1, 0.98])
+
+    if save_path is not None:
+        save_file = Path(save_path)
+        save_file.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(save_file, dpi=300, bbox_inches="tight")
+        plt.close(fig)
+
+    return embeddings_2d
+
+
+def plot_connectivity_heatmap(
+    matrix: np.ndarray,
+    title: str,
+    save_path: str = None,
+    cmap: str = "viridis",
+):
+    """Plot a single dense connectivity matrix."""
+    values = np.asarray(matrix, dtype=float)
+    if values.ndim != 2:
+        raise ValueError("matrix must be 2D")
+    if values.size == 0:
+        raise ValueError("matrix must be non-empty")
+    if not np.isfinite(values).all():
+        raise ValueError("matrix must contain only finite values")
+
+    fig, ax = plt.subplots(figsize=(6, 5))
+    sns.heatmap(values, ax=ax, cmap=cmap, square=True, cbar=True, xticklabels=False, yticklabels=False)
+    ax.set_title(title)
+    ax.set_xlabel("")
+    ax.set_ylabel("")
+    plt.tight_layout()
 
     if save_path is not None:
         save_file = Path(save_path)
         save_file.parent.mkdir(parents=True, exist_ok=True)
         plt.savefig(save_file, dpi=300, bbox_inches="tight")
-
-    plt.show()
-    return embeddings_2d
 
 
 def plot_contingency_heatmap(
@@ -551,4 +399,134 @@ def plot_contingency_heatmap(
         save_file.parent.mkdir(parents=True, exist_ok=True)
         plt.savefig(save_file, dpi=300, bbox_inches="tight")
 
-    plt.show()
+
+def plot_connectivity_triptych(
+    empirical_matrix: np.ndarray,
+    reconstructed_matrix: np.ndarray,
+    title: str,
+    save_path: str = None,
+    cmap: str = "viridis",
+    diff_cmap: str = "coolwarm"
+):
+    """
+    Plot empirical, reconstructed, residual, and empirical-vs-reconstructed correlation panels.
+
+    Args:
+        empirical_matrix: Ground-truth dense connectivity matrix.
+        reconstructed_matrix: Model-reconstructed dense connectivity matrix.
+        title: Figure title.
+        save_path: Optional path to save the figure.
+        cmap: Colormap for the empirical and reconstructed matrices.
+        diff_cmap: Colormap for the residual matrix.
+    """
+    empirical = np.asarray(empirical_matrix, dtype=float)
+    reconstructed = np.asarray(reconstructed_matrix, dtype=float)
+
+    if empirical.ndim != 2 or reconstructed.ndim != 2:
+        raise ValueError("empirical_matrix and reconstructed_matrix must be 2D arrays")
+    if empirical.shape != reconstructed.shape:
+        raise ValueError(
+            f"Matrix shape mismatch: empirical {empirical.shape} vs reconstructed {reconstructed.shape}"
+        )
+    if empirical.size == 0:
+        raise ValueError("Connectivity matrices must be non-empty")
+    if not np.isfinite(empirical).all() or not np.isfinite(reconstructed).all():
+        raise ValueError("Connectivity matrices must contain only finite values")
+
+    residual = reconstructed - empirical
+    finite_values = np.concatenate([empirical.ravel(), reconstructed.ravel()])
+    finite_values = finite_values[np.isfinite(finite_values)]
+    if finite_values.size == 0:
+        raise ValueError("Connectivity matrices must contain at least one finite value")
+
+    value_min = float(np.min(finite_values))
+    value_max = float(np.max(finite_values))
+    if value_min == value_max:
+        value_min -= 1.0
+        value_max += 1.0
+
+    diff_limit = float(np.max(np.abs(residual)))
+    if diff_limit == 0.0:
+        diff_limit = 1.0
+
+    upper_mask = np.triu(np.ones(empirical.shape, dtype=bool), k=1)
+    nonzero_mask = (empirical != 0.0) & (reconstructed != 0.0)
+    finite_mask = np.isfinite(empirical) & np.isfinite(reconstructed)
+    corr_mask = upper_mask & nonzero_mask & finite_mask
+    if not np.any(corr_mask):
+        raise ValueError("Connectivity matrices must contain at least one shared non-zero upper-triangular value")
+
+    empirical_vals = empirical[corr_mask]
+    reconstructed_vals = reconstructed[corr_mask]
+
+    if empirical_vals.size > 1 and np.std(empirical_vals) > 0.0 and np.std(reconstructed_vals) > 0.0:
+        corr = float(np.corrcoef(empirical_vals, reconstructed_vals)[0, 1])
+    else:
+        corr = float("nan")
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 12))
+    axes = axes.ravel()
+    panels = [
+        (empirical, "Empirical", value_min, value_max, cmap),
+        (reconstructed, "Reconstructed", value_min, value_max, cmap),
+        (residual, "Residual", -diff_limit, diff_limit, diff_cmap),
+    ]
+
+    for ax, (matrix, panel_title, vmin, vmax, panel_cmap) in zip(axes, panels):
+        sns.heatmap(
+            matrix,
+            ax=ax,
+            cmap=panel_cmap,
+            vmin=vmin,
+            vmax=vmax,
+            square=True,
+            cbar=True,
+            xticklabels=False,
+            yticklabels=False,
+        )
+        ax.set_title(panel_title)
+        ax.set_xlabel("")
+        ax.set_ylabel("")
+
+    corr_ax = axes[3]
+    scatter_min = float(min(np.min(empirical_vals), np.min(reconstructed_vals)))
+    scatter_max = float(max(np.max(empirical_vals), np.max(reconstructed_vals)))
+    if scatter_min == scatter_max:
+        scatter_min -= 1.0
+        scatter_max += 1.0
+
+    corr_ax.scatter(
+        empirical_vals,
+        reconstructed_vals,
+        s=10,
+        alpha=0.35,
+        edgecolors="none",
+        color="tab:blue",
+    )
+    corr_ax.plot([scatter_min, scatter_max], [scatter_min, scatter_max], linestyle="--", color="black", linewidth=1.2)
+    corr_ax.set_xlim(scatter_min, scatter_max)
+    corr_ax.set_ylim(scatter_min, scatter_max)
+    corr_ax.set_aspect("equal", adjustable="box")
+    corr_ax.set_xlabel("Empirical edge attributes")
+    corr_ax.set_ylabel("Predicted edge attributes")
+    corr_ax.set_title("Empirical vs Predicted")
+    corr_text = f"Pearson r = {corr:.3f}" if np.isfinite(corr) else "Pearson r = undefined"
+    corr_ax.text(
+        0.05,
+        0.95,
+        corr_text,
+        transform=corr_ax.transAxes,
+        ha="left",
+        va="top",
+        fontsize=11,
+        bbox=dict(boxstyle="round", facecolor="white", alpha=0.85, edgecolor="none"),
+    )
+    corr_ax.grid(True, alpha=0.25, linestyle="--")
+
+    fig.suptitle(title, fontsize=14, fontweight="bold")
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
+
+    if save_path is not None:
+        save_file = Path(save_path)
+        save_file.parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(save_file, dpi=300, bbox_inches="tight")

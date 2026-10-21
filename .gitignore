@@ -6,10 +6,19 @@ dist/
 wheels/
 *.egg-info
 .pytest_cache/
+.mypy_cache/
+htmlcov/
 uv.lock
+
+# Secrets
+.env
 
 # Virtual environments
 .venv
 
 # MAc things
 .DS_Store
+
+.coverage
+coverage.md
+*.ipynb

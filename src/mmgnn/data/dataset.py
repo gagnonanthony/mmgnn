@@ -2,156 +2,99 @@
 
 Converts connectivity matrices to PyTorch Geometric graphs with:
 - Graph topology: Derived by binarizing dMRI matrices (structural connectivity)
-- Node features: Anatomical volumes + graph metrics (degree, strength, clustering, etc.)
+- Node features: Anatomical volumes (or a constant ones channel if none are provided)
 - Edge weights: Primary dMRI metric values at edge positions
 - Edge attributes: All dMRI metrics + FC sampled only at existing edges
 
 Based on cs224w-brain-graphs preprocessing approach.
 """
 
-import os
 import hashlib
 import json
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+import logging
 
 import numpy as np
 import pandas as pd
 import torch
 from torch_geometric.data import Data, InMemoryDataset
-from typing import Dict, List, Optional, Tuple, Union
 from tqdm import tqdm
 
 
-def z_score_normalize(
-    features: Union[np.ndarray, torch.Tensor],
-    eps: float = 1e-8
-) -> Union[np.ndarray, torch.Tensor]:
+def _stem_contains_tag(stem: str, tag: str) -> bool:
+    """Return True if ``tag`` appears in ``stem`` with non-alphanumeric boundaries."""
+    if not tag:
+        return False
+    pattern = rf"(?<![A-Za-z0-9]){re.escape(tag)}(?![A-Za-z0-9])"
+    return re.search(pattern, stem) is not None
+
+
+def find_matrix_file(folder: Path | str, subject_id: str, metric: str) -> Path:
+    """Return the unique ``*.npy`` in ``folder`` matching subject id and metric tag.
+
+    Matching is delimiter-aware so short metrics like ``fa`` do not match ``afd``.
     """
-    Apply z-score normalization (standardization) to features.
-    
-    Z-score: (x - mean) / std
-    Normalizes each feature dimension independently to have mean=0, std=1.
-    
-    Args:
-        features: Feature array/tensor [N, F] where N=nodes/edges, F=features
-        eps: Small constant to avoid division by zero
-        
-    Returns:
-        Normalized features with same shape and type as input
-    """
-    is_torch = isinstance(features, torch.Tensor)
-    
-    if is_torch:
-        mean = features.mean(dim=0, keepdim=True)
-        std = features.std(dim=0, keepdim=True)
-        normalized = (features - mean) / (std + eps)
-    else:
-        mean = features.mean(axis=0, keepdims=True)
-        std = features.std(axis=0, keepdims=True)
-        normalized = (features - mean) / (std + eps)
+    directory = Path(folder)
+    if not directory.is_dir():
+        raise FileNotFoundError(f"Matrix folder not found: {directory}")
+    if not subject_id:
+        raise ValueError("subject_id is required to resolve matrix files")
+    if not metric:
+        raise ValueError("metric is required to resolve matrix files")
 
-    # Handle NaN/Inf that might arise from normalization
-    if is_torch:
-        normalized = torch.nan_to_num(normalized, nan=0.0, posinf=0.0, neginf=0.0)
-    else:
-        normalized = np.nan_to_num(normalized, nan=0.0, posinf=0.0, neginf=0.0)
-    
-    return normalized
+    matches = [
+        path
+        for path in sorted(directory.glob("*.npy"))
+        if _stem_contains_tag(path.stem, subject_id) and _stem_contains_tag(path.stem, metric)
+    ]
+    if not matches:
+        raise FileNotFoundError(
+            f"No .npy file in {directory} matched subject_id={subject_id!r} and metric={metric!r}"
+        )
+    if len(matches) > 1:
+        preview = ", ".join(str(path.name) for path in matches[:5])
+        suffix = "..." if len(matches) > 5 else ""
+        raise ValueError(
+            f"Ambiguous matrix files in {directory} for subject_id={subject_id!r} "
+            f"metric={metric!r}: {preview}{suffix}"
+        )
+    return matches[0]
 
 
-def compute_node_features(
-    adjacency: np.ndarray,
-    anatomical_features: Optional[np.ndarray] = None,
-    threshold: float = 0.0,
-    use_bct: bool = False
+def build_node_features(
+    num_nodes: int,
+    anatomical_features: np.ndarray | None = None,
 ) -> np.ndarray:
-    """
-    Compute node features from connectivity matrix and anatomical data.
-    
-    Features computed (similar to cs224w-brain-graphs):
-    1. Degree
-    2. Strength (weighted degree)
-    3. Clustering coefficient
-    4. Eigenvector centrality (if BCT available)
-    5. Participation coefficient (if BCT available)
-    
+    """Build node feature matrix from anatomical data, or a constant ones channel.
+
     Args:
-        adjacency: Connectivity matrix [N, N]
-        anatomical_features: Anatomical features (e.g., volumes) [N, F], optional
-        threshold: Threshold for binary adjacency (for degree/clustering)
-        use_bct: Whether to compute BCT metrics (requires bctpy)
-        
+        num_nodes: Number of graph nodes.
+        anatomical_features: Anatomical features (e.g., volumes) [N, F], optional.
+
     Returns:
-        Node features [N, num_features]
+        Node features [N, num_features].
     """
-    n = adjacency.shape[0]
-    abs_adj = np.abs(adjacency).astype(np.float64)
-    
-    # Threshold for binary metrics
-    binary_adj = (abs_adj > threshold).astype(float)
-    
-    # 1. Degree (binary)
-    degree = binary_adj.sum(axis=1).astype(np.float32)
-    
-    # 2. Strength (weighted)
-    strength = adjacency.sum(axis=1).astype(np.float32)
-    
-    # Initialize placeholders for optional metrics
-    clustering = np.zeros(n, dtype=np.float32)
-    eigenvec = np.zeros(n, dtype=np.float32)
-    participation = np.zeros(n, dtype=np.float32)
-    
-    # 4-5. BCT metrics (if available)
-    if use_bct:
-        try:
-            import bct  # type: ignore
-
-            # Clustering coefficient
-            try:
-                clustering = bct.clustering_coef_wu(abs_adj).astype(np.float32)
-            except Exception:
-                pass
-
-            # Eigenvector centrality
-            try:
-                eigenvec = bct.eigenvector_centrality_und(abs_adj).flatten().astype(np.float32)
-            except Exception:
-                pass
-            
-            # Participation coefficient (requires community detection)
-            try:
-                community, _ = bct.modularity_und(abs_adj)
-                # Silence runtimeWarning for invalid division in participation coefficient when degree=0
-                with np.errstate(divide='ignore', invalid='ignore'):
-                    participation = bct.participation_coef(abs_adj, community).astype(np.float32)
-            except Exception:
-                pass
-        except ImportError:
-            pass
-    
-    # Stack graph features
-    graph_features = np.stack([degree, strength, clustering, eigenvec, participation], axis=1)
-    
-    # Combine with anatomical features if provided
     if anatomical_features is not None:
-        # Ensure anatomical features are 2D
-        if anatomical_features.ndim == 1:
-            anatomical_features = anatomical_features.reshape(-1, 1)
-        features = np.concatenate([anatomical_features, graph_features], axis=1)
+        features = np.asarray(anatomical_features, dtype=np.float32)
+        if features.ndim == 1:
+            features = features.reshape(-1, 1)
+        if features.shape[0] != num_nodes:
+            raise ValueError(
+                f"anatomical_features has {features.shape[0]} rows but graph has {num_nodes} nodes"
+            )
     else:
-        features = graph_features
-    
-    # Handle NaN/Inf values
+        features = np.ones((num_nodes, 1), dtype=np.float32)
+
     features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
-    
     return features.astype(np.float32)
 
 
 def matrix_to_edge_index(
     matrix: np.ndarray,
     threshold: float = 0.0
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Convert adjacency matrix to edge_index and edge_weight tensors.
     
@@ -171,7 +114,7 @@ def matrix_to_edge_index(
 
 def gather_edge_attributes(
     edge_index: torch.Tensor,
-    matrices: Dict[str, np.ndarray]
+    matrices: dict[str, np.ndarray]
 ) -> torch.Tensor:
     """
     Gather edge attributes from multiple connectivity matrices.
@@ -264,168 +207,67 @@ def apply_density_threshold(
     return sorted_edges[target_edges] if target_edges < len(sorted_edges) else 0.0
 
 
-def _augment_edges_with_virtual_node(
-    edge_index: torch.Tensor,
-    num_nodes: int,
-    edge_weight: Optional[torch.Tensor] = None,
-    edge_attr: Optional[torch.Tensor] = None,
-    virtual_edge_weight: float = 1.0,
-    virtual_edge_strategy: str = "zeros",
-) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
-    """Attach a single virtual node to all graph nodes via bidirectional edges."""
-    if num_nodes <= 0:
-        raise ValueError("num_nodes must be positive to add a virtual node")
 
-    strategy = virtual_edge_strategy.lower().strip()
-    if strategy not in {"zeros", "edge_type"}:
-        raise ValueError("virtual_edge_strategy must be one of: 'zeros', 'edge_type'")
-
-    device = edge_index.device
-    dtype = edge_index.dtype
-    virtual_idx = num_nodes
-
-    nodes = torch.arange(num_nodes, device=device, dtype=dtype)
-    virtual_col = torch.full((num_nodes,), virtual_idx, device=device, dtype=dtype)
-
-    to_virtual = torch.stack([nodes, virtual_col], dim=0)
-    from_virtual = torch.stack([virtual_col, nodes], dim=0)
-    virtual_edges = torch.cat([to_virtual, from_virtual], dim=1)
-    augmented_edge_index = torch.cat([edge_index, virtual_edges], dim=1)
-
-    augmented_edge_weight = edge_weight
-    if edge_weight is not None:
-        new_weights = torch.full(
-            (virtual_edges.shape[1],),
-            float(virtual_edge_weight),
-            dtype=edge_weight.dtype,
-            device=edge_weight.device,
+def _require_primary_edge_attribute(primary_dmri_key: str, edge_attributes: list[str] | None) -> None:
+    """Fail before I/O when the topology metric is not an edge attribute."""
+    if primary_dmri_key not in (edge_attributes or []):
+        raise ValueError(
+            f"primary_dmri_key {primary_dmri_key!r} must appear in edge_attributes"
         )
-        augmented_edge_weight = torch.cat([edge_weight, new_weights], dim=0)
-
-    augmented_edge_attr = edge_attr
-    existing_edges = edge_index.shape[1]
-    new_edges = virtual_edges.shape[1]
-
-    if edge_attr is not None:
-        zeros_for_virtual = torch.zeros(
-            (new_edges, edge_attr.shape[1]),
-            dtype=edge_attr.dtype,
-            device=edge_attr.device,
-        )
-        augmented_edge_attr = torch.cat([edge_attr, zeros_for_virtual], dim=0)
-
-        if strategy == "edge_type":
-            edge_type_col = torch.cat(
-                [
-                    torch.zeros((existing_edges, 1), dtype=edge_attr.dtype, device=edge_attr.device),
-                    torch.ones((new_edges, 1), dtype=edge_attr.dtype, device=edge_attr.device),
-                ],
-                dim=0,
-            )
-            augmented_edge_attr = torch.cat([augmented_edge_attr, edge_type_col], dim=1)
-    elif strategy == "edge_type":
-        edge_type_col = torch.cat(
-            [
-                torch.zeros((existing_edges, 1), dtype=torch.float32, device=device),
-                torch.ones((new_edges, 1), dtype=torch.float32, device=device),
-            ],
-            dim=0,
-        )
-        augmented_edge_attr = edge_type_col
-
-    return augmented_edge_index, augmented_edge_weight, augmented_edge_attr
-
-
-def _augment_node_features_with_virtual_node(
-    x: torch.Tensor,
-    subject_covariates: Union[np.ndarray, torch.Tensor],
-    add_node_type_feature: bool = True,
-) -> torch.Tensor:
-    """Append one virtual node whose feature slots store subject-level covariates."""
-    if subject_covariates is None:
-        raise ValueError("subject_covariates is required when adding a virtual node")
-
-    if isinstance(subject_covariates, np.ndarray):
-        cov = torch.tensor(subject_covariates, dtype=x.dtype, device=x.device)
-    else:
-        cov = subject_covariates.to(device=x.device, dtype=x.dtype)
-
-    cov = cov.reshape(-1)
-    cov_dim = int(cov.numel())
-    num_nodes, base_dim = x.shape
-
-    if cov_dim > 0:
-        node_cov_padding = torch.zeros((num_nodes, cov_dim), dtype=x.dtype, device=x.device)
-        x_nodes = torch.cat([x, node_cov_padding], dim=1)
-
-        virtual_base = torch.cat(
-            [
-                torch.zeros((1, base_dim), dtype=x.dtype, device=x.device),
-                cov.unsqueeze(0),
-            ],
-            dim=1,
-        )
-    else:
-        x_nodes = x
-        virtual_base = torch.zeros((1, base_dim), dtype=x.dtype, device=x.device)
-
-    x_aug = torch.cat([x_nodes, virtual_base], dim=0)
-
-    if add_node_type_feature:
-        node_type = torch.zeros((x_aug.shape[0], 1), dtype=x.dtype, device=x.device)
-        node_type[-1, 0] = 1.0
-        x_aug = torch.cat([x_aug, node_type], dim=1)
-
-    return x_aug
 
 
 def create_pyg_data(
     dmri_path: str,
     primary_dmri_key: str,
     fc_path: str,
-    edge_attributes: Optional[List[str]] = None,
-    anatomical_features: Optional[np.ndarray] = None,
-    target: Optional[np.ndarray] = None,
-    subject_id: Optional[str] = None,
+    fc_metric: str,
+    edge_attributes: list[str] | None = None,
+    anatomical_features: np.ndarray | None = None,
+    target: np.ndarray | None = None,
+    subject_id: str | None = None,
     threshold: float = 0.0,
-    density: Optional[float] = None,
-    top_k: Optional[int] = None,
-    use_bct: bool = False,
+    density: float | None = None,
+    top_k: int | None = None,
     log_transform: bool = False,
-    dual_mode: bool = False,
-    add_virtual_node: bool = False,
-    subject_covariates: Optional[np.ndarray] = None,
-    add_node_type_feature: bool = True,
-    virtual_edge_strategy: str = "zeros",
 ) -> Data:
     """
     Create PyTorch Geometric Data object from brain connectivity data.
     
     Graph topology is derived by binarizing dMRI matrices (structural connectivity).
     All dMRI metrics + FC are sampled at edge positions as edge attributes.
+    Node features are anatomical volumes when provided, otherwise a constant ones channel.
+
+    Matrix files are resolved by matching ``subject_id`` and each metric tag inside
+    filenames under ``dmri_path`` / ``fc_path`` (segmentation naming is not hardcoded).
     
     Args:
-        dmri_matrices: Dictionary of dMRI metrics {name: matrix [N, N]}
+        dmri_path: Folder containing subject diffusion matrices (``*.npy``).
         primary_dmri_key: Which dMRI metric to use for graph topology and edge weights
-        edge_attributes: List of dMRI metric names to include as edge attributes (optional)
-        functional_connectivity: FC matrix [N, N] (sampled at edge positions only)
+        fc_path: Folder containing subject FC matrices (``*.npy``)
+        fc_metric: Metric tag used to discover the functional connectivity matrix
+        edge_attributes: dMRI metric names stored as edge attributes; must include ``primary_dmri_key``
         anatomical_features: Anatomical features [N, F] (e.g., volumes)
         target: Target values (e.g., behavioral scores)
-        subject_id: Subject identifier
+        subject_id: Subject identifier (required for on-disk matrix discovery)
         threshold: Edge weight threshold for graph topology
         density: Target graph density (overrides threshold)
         top_k: Keep top-K edges per node (overrides density and threshold)
-        use_bct: Whether to compute BCT metrics for node features
         log_transform: Whether to apply log transform to edge weights (optional)
         
     Returns:
         PyTorch Geometric Data object
     """
+    if edge_attributes is None:
+        edge_attributes = []
+    _require_primary_edge_attribute(primary_dmri_key, edge_attributes)
+    if not subject_id:
+        raise ValueError("subject_id is required to load subject matrix files")
+
     # Load subject-specific matrices
     dmri_matrices = {}
     expected_shape = None
     for key in edge_attributes:
-        mat = np.load(f"{dmri_path}/{subject_id}_seg-BrainnetomeChild_stat-{key}.npy")
+        mat = np.load(find_matrix_file(dmri_path, subject_id, key))
 
         if expected_shape is None:
             expected_shape = mat.shape
@@ -433,11 +275,6 @@ def create_pyg_data(
             raise ValueError(f"Shape mismatch for dMRI matrix '{key}' (expected {expected_shape}, got {mat.shape})")
         dmri_matrices[key] = mat
 
-    # Get primary dMRI matrix for defining graph structure
-    if primary_dmri_key not in dmri_matrices:
-        raise ValueError(f"Primary dMRI key '{primary_dmri_key}' not found in dmri_matrices")
-
-    # Get primary matrix for the current subject
     primary_matrix = dmri_matrices[primary_dmri_key]
     num_nodes = primary_matrix.shape[0]
     
@@ -464,66 +301,18 @@ def create_pyg_data(
 
     # Gather edge attributes: all dMRI metrics + FC sampled at edge positions
     sc_attr_dict = {key: matrix for key, matrix in dmri_matrices.items()}
-    edge_attr_sc = gather_edge_attributes(edge_index, sc_attr_dict) if sc_attr_dict else None
+    dmri_edge_attr = gather_edge_attributes(edge_index, sc_attr_dict) if sc_attr_dict else None
 
-    edge_attr_fc = None
-    if fc_path is not None:
-        functional_connectivity = np.load(f"{fc_path}/{subject_id}_seg-BrainnetomeChild_stat-pearsoncorrelation_relmat.npy")
-        edge_attr_fc = gather_edge_attributes(edge_index, {"fc": functional_connectivity})
+    functional_connectivity = np.load(find_matrix_file(fc_path, subject_id, fc_metric))
+    fc_edge_attr = gather_edge_attributes(edge_index, {"fc": functional_connectivity})
 
-    combined_edge_attrs = [attr for attr in [edge_attr_sc, edge_attr_fc] if attr is not None]
+    combined_edge_attrs = [attr for attr in [dmri_edge_attr, fc_edge_attr] if attr is not None]
     edge_attr = torch.cat(combined_edge_attrs, dim=1) if combined_edge_attrs else None
 
-    # Compute node features from the graph structure
-    thresholded = primary_matrix.copy()
-    thresholded[np.abs(thresholded) <= effective_threshold] = 0.0
-
-    x = compute_node_features(
-        thresholded,
-        anatomical_features=anatomical_features,
-        threshold=0.0,  # Already thresholded above
-        use_bct=use_bct
+    x = torch.tensor(
+        build_node_features(num_nodes, anatomical_features=anatomical_features),
+        dtype=torch.float32,
     )
-    x = torch.tensor(x, dtype=torch.float32)
-
-    edge_index_sc = edge_index
-    edge_weight_sc = edge_weight
-    edge_attr_sc_aug = edge_attr_sc
-    edge_index_fc = edge_index
-    edge_weight_fc = edge_weight
-    edge_attr_fc_aug = edge_attr_fc
-
-    if add_virtual_node:
-        x = _augment_node_features_with_virtual_node(
-            x=x,
-            subject_covariates=subject_covariates,
-            add_node_type_feature=add_node_type_feature,
-        )
-        edge_index, edge_weight, edge_attr = _augment_edges_with_virtual_node(
-            edge_index=edge_index,
-            num_nodes=num_nodes,
-            edge_weight=edge_weight,
-            edge_attr=edge_attr,
-            virtual_edge_strategy=virtual_edge_strategy,
-        )
-
-        if dual_mode:
-            edge_index_sc, edge_weight_sc, edge_attr_sc_aug = _augment_edges_with_virtual_node(
-                edge_index=edge_index_sc,
-                num_nodes=num_nodes,
-                edge_weight=edge_weight_sc,
-                edge_attr=edge_attr_sc_aug,
-                virtual_edge_strategy=virtual_edge_strategy,
-            )
-            edge_index_fc, edge_weight_fc, edge_attr_fc_aug = _augment_edges_with_virtual_node(
-                edge_index=edge_index_fc,
-                num_nodes=num_nodes,
-                edge_weight=edge_weight_fc,
-                edge_attr=edge_attr_fc_aug,
-                virtual_edge_strategy=virtual_edge_strategy,
-            )
-
-        num_nodes = num_nodes + 1
 
     # Set target variable if provided
     if target is not None:
@@ -544,20 +333,6 @@ def create_pyg_data(
     if edge_attr is not None:
         data.edge_attr = edge_attr
 
-    if dual_mode:
-        data.edge_index_sc = edge_index_sc
-        data.edge_weight_sc = edge_weight_sc
-        data.edge_index_fc = edge_index_fc
-        data.edge_weight_fc = edge_weight_fc
-        if edge_attr_sc_aug is not None:
-            data.edge_attr_sc = edge_attr_sc_aug
-        if edge_attr_fc_aug is not None:
-            data.edge_attr_fc = edge_attr_fc_aug
-
-    data.has_virtual_node = bool(add_virtual_node)
-    if add_virtual_node:
-        data.virtual_node_index = int(num_nodes - 1)
-
     if subject_id is not None:
         data.subject_id = subject_id
 
@@ -572,42 +347,33 @@ class BrainGraphDataset(InMemoryDataset):
 
     def __init__(
         self,
-        subjects_file=None,
-        dmri_folder=None,
-        fc_folder=None,
-        anatomical_df: Optional[Union[str, List[str]]] = None,
-        targets_df=None,
-        primary_dmri_key=None,
-        edge_attributes=None,
-        threshold=None,
-        density=None,
-        top_k=None,
-        use_bct=False,
-        log_transform=False,
-        split_name=None,
-        target_columns=None,
-        cache_dir="cache",
-        transform=None,
-        pre_transform=None,
-        pre_filter=None,
-        force_reload=False,
-        num_workers=4,
-        dual_mode: bool = False,
-        covariates_df: Optional[str] = None,
-        covariate_columns: Optional[List[Union[str, int]]] = None,
-        add_virtual_node: bool = False,
-        add_node_type_feature: bool = True,
-        virtual_edge_strategy: str = "zeros",
-        write_cache_payload_debug: bool = True,
+        subjects_file: str,
+        dmri_folder: str,
+        fc_folder: str,
+        fc_metric: str,
+        anatomical_df: str | list[str] | None,
+        primary_dmri_key: str,
+        targets_df: str = None,
+        edge_attributes: list[str] = None,
+        threshold: float = None,
+        density: float = None,
+        top_k: int = None,
+        log_transform: bool = False,
+        target_columns: list[str] = None,
+        cache_dir: str = "cache",
+        force_reload: bool = False,
+        num_workers: int = 4,
+        write_cache_payload_debug: bool = False,
     ):
         if edge_attributes is None:
             edge_attributes = []
+        _require_primary_edge_attribute(primary_dmri_key, edge_attributes)
 
         self.subjects_file = Path(subjects_file)
         self.dmri_folder = Path(dmri_folder)
         self.fc_folder = Path(fc_folder)
         if anatomical_df is None:
-            self.anatomical_dfs: List[Path] = []
+            self.anatomical_dfs: list[Path] = []
         elif isinstance(anatomical_df, (str, Path)):
             self.anatomical_dfs = [Path(anatomical_df)]
         else:
@@ -620,41 +386,30 @@ class BrainGraphDataset(InMemoryDataset):
         self.threshold = threshold
         self.density = density
         self.top_k = top_k
-        self.use_bct = use_bct
         self.log_transform = log_transform
-        self.split_name = split_name
         self.target_columns = target_columns
         self.cache_dir = cache_dir
-        self.transform = transform
-        self.pre_transform = pre_transform
-        self.pre_filter = pre_filter
         self._force_reload = force_reload
         self.num_workers = num_workers
-        self.dual_mode = dual_mode
-        self.covariates_df = Path(covariates_df) if covariates_df else None
-        self.covariate_columns = covariate_columns
-        self.add_virtual_node = add_virtual_node
-        self.add_node_type_feature = add_node_type_feature
-        self.virtual_edge_strategy = virtual_edge_strategy
         self.write_cache_payload_debug = write_cache_payload_debug
-        self._anatomical_feature_names: List[str] = []
+        self.fc_metric = fc_metric
+        self._anatomical_feature_names: list[str] = []
 
         # Load subject, dmri mats, fc mats, anatomical features, and targets into memory
         self._subject_ids = self._load_subject_ids()
         self._anatomical_features = self._load_anatomical_features() if self.anatomical_dfs else None
-        self._covariates = self._load_covariates() if self.covariates_df else None
         self._targets = self._load_targets() if self.targets_df else None
 
         self._cache_payload = self._build_cache_payload()
         root = Path(self.cache_dir) / self._get_cache_name(payload=self._cache_payload)
 
-        super().__init__(str(root), transform, pre_transform, pre_filter)
+        super().__init__(str(root))
         self.load(self.processed_paths[0])
 
         if self.write_cache_payload_debug:
             self._write_cache_payload_debug_file(root)
 
-    def _load_subject_ids(self) -> List[str]:
+    def _load_subject_ids(self) -> list[str]:
         if not self.subjects_file.exists():
             raise FileNotFoundError(f"Subjects file not found: {self.subjects_file}")
         
@@ -672,15 +427,15 @@ class BrainGraphDataset(InMemoryDataset):
             return pd.read_csv(path, sep="\t")
         return pd.read_csv(path)
 
-    def _load_anatomical_features(self) -> Dict[str, pd.DataFrame]:
+    def _load_anatomical_features(self) -> dict[str, pd.DataFrame]:
         """Load anatomical files as per-node feature channels keyed by file stem.
 
         Each file must have `sid` and node columns. For a subject row, node values
         are interpreted as a vector of length num_nodes. Multiple files are stacked
         as multiple channels: [num_nodes, num_anatomical_features].
         """
-        loaded: Dict[str, pd.DataFrame] = {}
-        feature_names: List[str] = []
+        loaded: dict[str, pd.DataFrame] = {}
+        feature_names: list[str] = []
 
         for anat_path in self.anatomical_dfs:
             if not anat_path.exists():
@@ -717,7 +472,7 @@ class BrainGraphDataset(InMemoryDataset):
         self._anatomical_feature_names = feature_names
         return loaded
 
-    def _load_targets(self) -> Dict[str, np.ndarray]:
+    def _load_targets(self) -> dict[str, np.ndarray]:
         # Implement loading of target values for all subjects
         if not self.targets_df.exists():
             raise FileNotFoundError(f"Targets file not found: {self.targets_df}")
@@ -730,85 +485,26 @@ class BrainGraphDataset(InMemoryDataset):
         # Small filtering to ensure we only keep subjects in our subject list
         return df[df['subjectkey'].isin(self._subject_ids)]
 
-    def _load_covariates(self) -> pd.DataFrame:
-        if self.covariates_df is None or not self.covariates_df.exists():
-            raise FileNotFoundError(f"Covariates file not found: {self.covariates_df}")
 
-        suffix = self.covariates_df.suffix.lower()
-        if suffix in {".xlsx", ".xls"}:
-            df = pd.read_excel(self.covariates_df)
-        elif suffix == ".tsv":
-            df = pd.read_csv(self.covariates_df, sep="\t")
-        else:
-            df = pd.read_csv(self.covariates_df)
-
-        if "sid" in df.columns:
-            id_col = "sid"
-            df["sid"] = df["sid"].astype(str)
-        elif "subjectkey" in df.columns:
-            id_col = "subjectkey"
-            df["sid"] = df["subjectkey"].apply(
-                lambda x: f"sub-{str(x).replace('_', '')}" if isinstance(x, str) else f"sub-{x}"
-            )
-        else:
-            raise ValueError("Covariates file must contain either 'sid' or 'subjectkey' column")
-
-        if self.covariate_columns is None:
-            candidate_cols = [c for c in df.columns if c not in {id_col, "sid", "subjectkey"}]
-            selected_cols = [c for c in candidate_cols if pd.api.types.is_numeric_dtype(df[c])]
-            if not selected_cols:
-                raise ValueError("No numeric covariate columns found in covariates file")
-        else:
-            selected_cols = []
-            for col in self.covariate_columns:
-                if isinstance(col, int):
-                    selected_cols.append(df.columns[col])
-                elif isinstance(col, str):
-                    if col not in df.columns:
-                        raise KeyError(f"Unknown covariate column '{col}'")
-                    selected_cols.append(col)
-                else:
-                    raise TypeError(
-                        f"Unsupported covariate column type: {type(col).__name__}. "
-                        "covariate_columns entries must be int or str."
-                    )
-
-        subset_cols = ["sid", *selected_cols]
-        filtered = df[df["sid"].isin(self._subject_ids)][subset_cols].copy()
-
-        for col in selected_cols:
-            filtered[col] = pd.to_numeric(filtered[col], errors="coerce")
-
-        filtered[selected_cols] = filtered[selected_cols].fillna(0.0)
-        return filtered
-
-    def _build_cache_payload(self) -> Dict[str, object]:
+    def _build_cache_payload(self) -> dict[str, object]:
         """Collect all configuration fields that define cached graph materialization."""
         return {
-            "atlas": "brainnetome",
             "primary_dmri_key": self.primary_dmri_key,
             "threshold": self.threshold,
             "density": self.density,
             "top_k": self.top_k,
-            "use_bct": self.use_bct,
             "log_transform": self.log_transform,
             "edge_attributes": sorted(self.edge_attributes),
-            "dual_mode": self.dual_mode,
-            "split_name": self.split_name,
             "target_columns": self.target_columns,
             "subjects_file": str(self.subjects_file),
             "subject_ids": self._subject_ids,
             "anatomical_df": [str(p) for p in self.anatomical_dfs] if self.anatomical_dfs else None,
             "targets_df": str(self.targets_df) if self.targets_df is not None else None,
-            "fc_folder": str(self.fc_folder) if self.fc_folder is not None else None,
-            "covariates_df": str(self.covariates_df) if self.covariates_df is not None else None,
-            "covariate_columns": self.covariate_columns,
-            "add_virtual_node": self.add_virtual_node,
-            "add_node_type_feature": self.add_node_type_feature,
-            "virtual_edge_strategy": self.virtual_edge_strategy,
+            "fc_folder": str(self.fc_folder),
+            "fc_metric": self.fc_metric,
         }
 
-    def _get_cache_name(self, payload: Optional[Dict[str, object]] = None) -> str:
+    def _get_cache_name(self, payload: dict[str, object] | None = None) -> str:
         """Build a short, deterministic cache directory name.
 
         Verbose feature lists can exceed filesystem path limits on some systems.
@@ -821,28 +517,27 @@ class BrainGraphDataset(InMemoryDataset):
         payload_text = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         checksum = hashlib.blake2s(payload_text.encode("utf-8"), digest_size=4).hexdigest()
 
-        split = f"_{self.split_name}" if self.split_name else ""
         primary = str(self.primary_dmri_key).replace(" ", "")
-        return f"brainnetome_{primary}_cfg_{checksum}{split}"
+        return f"{primary}_cfg_{checksum}"
 
     def _write_cache_payload_debug_file(self, root: Path) -> None:
         """Persist unhashed cache payload next to processed outputs for traceability."""
         try:
             root.mkdir(parents=True, exist_ok=True)
             debug_path = root / "cache_payload.json"
-            with open(debug_path, "w", encoding="utf-8") as f:
-                json.dump(self._cache_payload, f, indent=2, sort_keys=True)
-        except Exception:
+            with open(debug_path, "w", encoding="utf-8") as handle:
+                json.dump(self._cache_payload, handle, indent=2, sort_keys=True)
+        except OSError as error:
             # Debug export should never break dataset loading.
-            pass
+            logging.warning("Could not write cache payload debug file: %s", error)
 
     @property
-    def processed_file_names(self) -> List[str]:
+    def processed_file_names(self) -> list[str]:
         return ["data.pt"]
 
     # Attribute mapping feature names to indices for easier access in transforms/models
     @property
-    def node_feature_indices(self) -> Dict[str, int]:
+    def node_feature_indices(self) -> dict[str, int]:
         indices = {}
         idx = 0
 
@@ -850,26 +545,14 @@ class BrainGraphDataset(InMemoryDataset):
             for feature_name in self._anatomical_feature_names:
                 indices[feature_name] = idx
                 idx += 1
-
-        # Graph features are always in the same order: degree, strength, clustering, eigenvec, participation
-        graph_feature_names = ['degree', 'strength', 'clustering', 'eigenvector_centrality', 'participation_coefficient']
-        for name in graph_feature_names:
-            indices[name] = idx
+        else:
+            indices["constant"] = idx
             idx += 1
-
-        if self.add_virtual_node and self._covariates is not None:
-            covariate_cols = [c for c in self._covariates.columns if c != "sid"]
-            for name in covariate_cols:
-                indices[f"covariate::{name}"] = idx
-                idx += 1
-
-            if self.add_node_type_feature:
-                indices["node_type"] = idx
 
         return indices
 
     @property
-    def edge_attribute_indices(self) -> Dict[str, int]:
+    def edge_attribute_indices(self) -> dict[str, int]:
         indices = {}
         idx = 0
 
@@ -878,13 +561,12 @@ class BrainGraphDataset(InMemoryDataset):
             idx += 1
 
         # FC attributes are added after dMRI attributes
-        if self.fc_folder is not None:
-            indices['fc'] = idx
+        indices['fc'] = idx
 
         return indices
 
     @property
-    def target_indices(self) -> Dict[str, int]:
+    def target_indices(self) -> dict[str, int]:
         indices = {}
         if self.targets_df is not None:
             if self.target_columns is None:
@@ -911,201 +593,93 @@ class BrainGraphDataset(InMemoryDataset):
         return indices
 
     def process(self):
-        print(f"Processing {len(self._subject_ids)} brain graphs...")
+        logging.info("Processing %d brain graphs...", len(self._subject_ids))
 
         def load_single(args):
             sid, dmri_path, fc_path = args
-            try:
-                # Extract anatomical features for this subject if available
-                anat_feats = None
-                if self._anatomical_features is not None:
-                    anat_vectors: List[np.ndarray] = []
-                    for feature_name in self._anatomical_feature_names:
-                        df = self._anatomical_features[feature_name]
-                        anat_row = df[df['sid'] == sid]
-                        if anat_row.empty:
-                            raise ValueError(
-                                f"Missing anatomical feature '{feature_name}' for subject {sid}"
-                            )
+            # Extract anatomical features for this subject if available
+            anat_feats = None
+            if self._anatomical_features is not None:
+                anat_vectors: list[np.ndarray] = []
+                for feature_name in self._anatomical_feature_names:
+                    df = self._anatomical_features[feature_name]
+                    anat_row = df[df['sid'] == sid]
+                    if anat_row.empty:
+                        raise ValueError(
+                            f"Missing anatomical feature '{feature_name}' for subject {sid}"
+                        )
 
-                        node_vector = anat_row.drop(columns=['sid']).values.flatten().astype(np.float32)
-                        anat_vectors.append(node_vector)
+                    node_vector = anat_row.drop(columns=['sid']).values.flatten().astype(np.float32)
+                    anat_vectors.append(node_vector)
 
-                    if len(anat_vectors) == 1:
-                        anat_feats = anat_vectors[0]
-                    elif len(anat_vectors) > 1:
-                        lengths = {vec.shape[0] for vec in anat_vectors}
-                        if len(lengths) != 1:
-                            raise ValueError(
-                                "All anatomical channels must contain the same number of nodes"
-                            )
-                        anat_feats = np.stack(anat_vectors, axis=1)
-                
-                # Extract targets for this subject if available
-                target_vals = None
-                if self._targets is not None:
-                    target_row = self._targets[self._targets['subjectkey'] == sid]
-                    if not target_row.empty:
-                        # Select target columns
-                        if self.target_columns is not None:
-                            if isinstance(self.target_columns, (int, str)):
-                                # Single target
-                                target_vals = target_row.iloc[:, [self.target_columns]].values.flatten()
-                            else:
-                                # Multiple targets (list of indices or column names)
-                                target_vals = target_row.iloc[:, self.target_columns].values.flatten()
+                if len(anat_vectors) == 1:
+                    anat_feats = anat_vectors[0]
+                elif len(anat_vectors) > 1:
+                    lengths = {vec.shape[0] for vec in anat_vectors}
+                    if len(lengths) != 1:
+                        raise ValueError(
+                            "All anatomical channels must contain the same number of nodes"
+                        )
+                    anat_feats = np.stack(anat_vectors, axis=1)
+
+            # Extract targets for this subject if available
+            target_vals = None
+            if self._targets is not None:
+                target_row = self._targets[self._targets['subjectkey'] == sid]
+                if not target_row.empty:
+                    # Select target columns
+                    if self.target_columns is not None:
+                        if isinstance(self.target_columns, (int, str)):
+                            # Single target
+                            target_vals = target_row.iloc[:, [self.target_columns]].values.flatten()
                         else:
-                            # Default: get last 4 columns (assuming they are the targets)
-                            target_vals = target_row.iloc[:, -4:].values.flatten()
+                            # Multiple targets (list of indices or column names)
+                            target_vals = target_row.iloc[:, self.target_columns].values.flatten()
+                    else:
+                        # Default: get last 4 columns (assuming they are the targets)
+                        target_vals = target_row.iloc[:, -4:].values.flatten()
 
-                subject_covariates = None
-                if self.add_virtual_node:
-                    if self._covariates is None:
-                        raise ValueError("add_virtual_node=True requires covariates_df to be provided")
-
-                    cov_row = self._covariates[self._covariates["sid"] == sid]
-                    if cov_row.empty:
-                        raise ValueError(f"Missing covariates for subject {sid}")
-
-                    subject_covariates = cov_row.drop(columns=["sid"]).values.flatten().astype(np.float32)
-                
-                data = create_pyg_data(
-                    dmri_path=str(dmri_path),
-                    primary_dmri_key=self.primary_dmri_key,
-                    fc_path=str(fc_path),
-                    edge_attributes=self.edge_attributes,
-                    anatomical_features=anat_feats,
-                    target=target_vals,
-                    subject_id=sid,
-                    threshold=self.threshold,
-                    density=self.density,
-                    top_k=self.top_k,
-                    use_bct=self.use_bct,
-                    log_transform=self.log_transform,
-                    dual_mode=self.dual_mode,
-                    add_virtual_node=self.add_virtual_node,
-                    subject_covariates=subject_covariates,
-                    add_node_type_feature=self.add_node_type_feature,
-                    virtual_edge_strategy=self.virtual_edge_strategy,
-                )
-                return (sid, data, None)
-            except Exception as e:
-                return (sid, None, str(e))
+            return create_pyg_data(
+                dmri_path=str(dmri_path),
+                primary_dmri_key=self.primary_dmri_key,
+                fc_path=str(fc_path),
+                edge_attributes=self.edge_attributes,
+                anatomical_features=anat_feats,
+                target=target_vals,
+                subject_id=sid,
+                threshold=self.threshold,
+                density=self.density,
+                top_k=self.top_k,
+                log_transform=self.log_transform,
+                fc_metric=self.fc_metric,
+            )
 
         data_list = []
-        errors = []
-        print(f"Using {self.num_workers} workers for parallel processing")
+        logging.info("Using %d workers for parallel processing", self.num_workers)
 
         with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
-            futures = {executor.submit(load_single, args): args[0] for args in [(sid, self.dmri_folder, self.fc_folder) for sid in self._subject_ids]}
+            jobs = [(sid, self.dmri_folder, self.fc_folder) for sid in self._subject_ids]
+            futures = [executor.submit(load_single, args) for args in jobs]
             for future in tqdm(as_completed(futures), total=len(futures), desc="Processing brain graphs"):
-                sid, data, error = future.result()
-                if error:
-                    errors.append(f"Subject {sid}: {error}")
-                else:
-                    data_list.append(data) 
-
-        if errors:
-            print(f"Encountered {len(errors)} errors during processing:")
-            for err in errors[:5]:
-                print(err)
+                data_list.append(future.result())
 
         if not data_list:
             raise ValueError("No valid brain graphs were processed successfully.")
 
         data_list.sort(key=lambda d: d.subject_id)  # Sort by subject ID for consistency
 
-        if self.pre_filter is not None:
-            data_list = [d for d in data_list if self.pre_filter(d)]
-
         self.save(data_list, self.processed_paths[0])
-        print(f"Saved processed dataset with {len(data_list)} graphs to {self.processed_paths[0]}")
-
-
-def prepare_brain_graph_dataset(
-    subject_list: List[str],
-    dmri_matrices: Dict[str, Dict[str, np.ndarray]],
-    primary_dmri_key: str,
-    fc_matrices: Optional[Dict[str, np.ndarray]] = None,
-    anatomical_features: Optional[Dict[str, np.ndarray]] = None,
-    targets: Optional[Dict[str, np.ndarray]] = None,
-    threshold: float = 0.0,
-    density: Optional[float] = None,
-    top_k: Optional[int] = None,
-    use_bct: bool = False,
-    normalize: bool = True
-) -> List[Data]:
-    """
-    Prepare complete dataset of brain graphs from connectivity data.
-    
-    Graph topology derived from binarized dMRI (structural connectivity).
-    FC and all dMRI metrics sampled as edge attributes at edge positions.
-    
-    Args:
-        subject_list: List of subject IDs
-        dmri_matrices: dMRI features {subject_id: {metric: matrix}}
-        primary_dmri_key: Which dMRI metric defines graph structure (e.g., 'afd_fixel')
-        fc_matrices: Functional connectivity {subject_id: matrix}
-        anatomical_features: Anatomical features {subject_id: features}
-        targets: Target values {subject_id: target}
-        threshold: Edge weight threshold for graph topology
-        density: Target graph density
-        top_k: Keep top-K edges per node
-        use_bct: Whether to compute BCT metrics
-        normalize: Whether to apply z-score normalization to features
-        
-    Returns:
-        List of PyTorch Geometric Data objects
-    """
-    from tqdm import tqdm
-    
-    dataset = []
-    
-    for subject_id in tqdm(subject_list, desc="Creating brain graphs"):
-        try:
-            # Get dMRI matrices (required)
-            dmri_mats = dmri_matrices.get(subject_id)
-            if dmri_mats is None or primary_dmri_key not in dmri_mats:
-                continue
-            
-            # Get functional connectivity (optional)
-            fc = fc_matrices.get(subject_id) if fc_matrices else None
-            
-            # Get anatomical features (optional)
-            anat_feats = anatomical_features.get(subject_id) if anatomical_features else None
-            
-            # Get target (optional)
-            target = targets.get(subject_id) if targets else None
-            
-            # Create graph
-            data = create_pyg_data(
-                dmri_matrices=dmri_mats,
-                primary_dmri_key=primary_dmri_key,
-                functional_connectivity=fc,
-                anatomical_features=anat_feats,
-                target=target,
-                subject_id=subject_id,
-                threshold=threshold,
-                density=density,
-                top_k=top_k,
-                use_bct=use_bct,
-                normalize=normalize
-            )
-            
-            dataset.append(data)
-            
-        except Exception as e:
-            print(f"Error processing subject {subject_id}: {e}")
-            continue
-    
-    print(f"Created dataset with {len(dataset)} brain graphs")
-    return dataset
+        logging.info(
+            "Saved processed dataset with %d graphs to %s",
+            len(data_list),
+            self.processed_paths[0],
+        )
 
 
 def save_dataset(
-    dataset: List[Data],
+    dataset: list[Data],
     save_path: str,
-    metadata: Optional[Dict] = None
+    metadata: dict | None = None
 ) -> None:
     """
     Save PyTorch Geometric dataset to disk for faster loading.
@@ -1115,24 +689,23 @@ def save_dataset(
         save_path: Path to save file (.pt extension recommended)
         metadata: Optional metadata dictionary (preprocessing parameters, etc.)
     """
-    save_dir = os.path.dirname(save_path)
-    if save_dir and not os.path.exists(save_dir):
-        os.makedirs(save_dir, exist_ok=True)
-    
+    path = Path(save_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
     save_dict = {
         'dataset': dataset,
         'num_graphs': len(dataset),
         'metadata': metadata or {}
     }
-    
-    torch.save(save_dict, save_path)
-    print(f"Saved {len(dataset)} graphs to {save_path}")
+
+    torch.save(save_dict, path)
+    logging.info("Saved %d graphs to %s", len(dataset), save_path)
 
 
 def load_dataset(
     load_path: str,
     return_metadata: bool = False
-) -> List[Data] | Tuple[List[Data], Dict]:
+) -> list[Data] | tuple[list[Data], dict]:
     """
     Load PyTorch Geometric dataset from disk.
     
@@ -1143,100 +716,17 @@ def load_dataset(
     Returns:
         List of PyG Data objects, or (dataset, metadata) if return_metadata=True
     """
-    if not os.path.exists(load_path):
+    path = Path(load_path)
+    if not path.is_file():
         raise FileNotFoundError(f"Dataset file not found: {load_path}")
-    
-    save_dict = torch.load(load_path, weights_only=False)
+
+    save_dict = torch.load(path, weights_only=False)
     dataset = save_dict['dataset']
     
-    print(f"Loaded {len(dataset)} graphs from {load_path}")
+    logging.info("Loaded %d graphs from %s", len(dataset), load_path)
     
     if return_metadata:
         metadata = save_dict.get('metadata', {})
         return dataset, metadata
     else:
         return dataset
-
-
-def get_cache_filename(
-    primary_dmri_key: str,
-    threshold: float = 0.0,
-    density: Optional[float] = None,
-    top_k: Optional[int] = None,
-    use_bct: bool = False,
-    normalize: bool = True,
-    suffix: str = ""
-) -> str:
-    """
-    Generate standardized cache filename based on preprocessing parameters.
-    
-    Args:
-        primary_dmri_key: Primary dMRI metric used for graph topology
-        threshold: Threshold value
-        density: Density value (if used)
-        top_k: Top-K value (if used)
-        use_bct: Whether BCT metrics were used
-        normalize: Whether features are normalized
-        suffix: Optional suffix (e.g., '_train', '_val')
-        
-    Returns:
-        Filename string
-    """
-    parts = [f"brain_graphs_{primary_dmri_key}"]
-    
-    if top_k is not None and top_k > 0:
-        parts.append(f"topk{top_k}")
-    elif density is not None:
-        parts.append(f"density{density:.3f}")
-    else:
-        parts.append(f"thr{threshold:.3f}")
-    
-    if use_bct:
-        parts.append("bct")
-    
-    if normalize:
-        parts.append("norm")
-    
-    if suffix:
-        parts.append(suffix)
-    
-    return "_".join(parts) + ".pt"
-
-
-def prepare_or_load_dataset(
-    cache_path: str,
-    force_recompute: bool = False,
-    **prepare_kwargs
-) -> List[Data]:
-    """
-    Load dataset from cache if available, otherwise compute and save.
-    
-    Args:
-        cache_path: Path to cache file
-        force_recompute: If True, recompute even if cache exists
-        **prepare_kwargs: Arguments for prepare_brain_graph_dataset()
-        
-    Returns:
-        List of PyG Data objects
-    """
-    if os.path.exists(cache_path) and not force_recompute:
-        print(f"Loading dataset from cache: {cache_path}")
-        dataset = load_dataset(cache_path)
-    else:
-        print("Computing dataset from scratch...")
-        dataset = prepare_brain_graph_dataset(**prepare_kwargs)
-        
-        # Save metadata for reproducibility
-        metadata = {
-            'primary_dmri_key': prepare_kwargs.get('primary_dmri_key'),
-            'threshold': prepare_kwargs.get('threshold', 0.0),
-            'density': prepare_kwargs.get('density'),
-            'top_k': prepare_kwargs.get('top_k'),
-            'use_bct': prepare_kwargs.get('use_bct', False),
-            'normalize': prepare_kwargs.get('normalize', True),
-            'num_subjects': len(prepare_kwargs.get('subject_list', []))
-        }
-        
-        save_dataset(dataset, cache_path, metadata=metadata)
-    
-    return dataset

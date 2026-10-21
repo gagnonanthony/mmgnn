@@ -6,7 +6,6 @@ DataLoaders for training, validation, and testing based on a InMemoryDataset.
 """
 
 from pathlib import Path
-from typing import Tuple, List, Optional, Dict
 
 from torch_geometric.data import InMemoryDataset
 
@@ -28,17 +27,21 @@ class DataSplitter:
             self.test_subjects = Path(test_subjects)
 
     @staticmethod
-    def _load_subject_ids(file_path: Path) -> List[str]:
+    def _load_subject_ids(file_path: Path) -> list[str]:
         with open(file_path, 'r') as f:
             subject_ids = [line.strip() for line in f if line.strip()]
         return subject_ids
 
-    def _get_indices_for_subjects(self, subject_ids: List[str]) -> Dict[str, int]:
+    def _get_indices_for_subjects(self, subject_ids: list[str]) -> dict[str, int]:
         subject_to_index = {self.dataset[i].subject_id: i for i in range(len(self.dataset))}
-        indices = {sid: subject_to_index[sid] for sid in subject_ids if sid in subject_to_index}
-        return indices
+        missing = [sid for sid in subject_ids if sid not in subject_to_index]
+        if missing:
+            preview = ", ".join(missing[:5])
+            suffix = "..." if len(missing) > 5 else ""
+            raise ValueError(f"Subjects not found in dataset ({len(missing)}): {preview}{suffix}")
+        return {sid: subject_to_index[sid] for sid in subject_ids if sid in subject_to_index}
 
-    def get_split_indices(self) -> Tuple[Dict[str, int], Optional[Dict[str, int]], Optional[Dict[str, int]]]:
+    def get_split_indices(self) -> tuple[dict[str, int], dict[str, int] | None, dict[str, int] | None]:
         train_subject_ids = self._load_subject_ids(self.train_subjects)
         train_indices = self._get_indices_for_subjects(train_subject_ids)
 

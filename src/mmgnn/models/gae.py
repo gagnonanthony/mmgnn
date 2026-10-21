@@ -137,13 +137,14 @@ class NodeMLPDecoder(nn.Module):
 
 
 class GAE(nn.Module):
-    """Graph autoencoder with configurable edge decoder and optional node decoder."""
+    """Graph autoencoder with separate edge-presence and edge-attribute decoders."""
 
     def __init__(
         self,
         encoder: Encoder,
-        edge_decoder_type: str = "inner_product",
-        edge_out_dim: int | None = None,
+        edge_presence_decoder_type: str = "inner_product",
+        edge_attr_out_dim: int | None = None,
+        edge_attr_decoder_type: str = "mlp",
         decode_node_features: bool = True,
         node_out_dim: int | None = None,
         decoder_hidden_dim: int | None = None,
@@ -154,25 +155,34 @@ class GAE(nn.Module):
 
         # Auto-infer decoder output shapes from the encoder's input spaces.
         inferred_node_out_dim = encoder.in_channels
-        inferred_edge_out_dim = encoder.edge_dim if encoder.edge_dim is not None and encoder.edge_dim > 0 else 1
+        inferred_edge_attr_dim = encoder.edge_dim if encoder.edge_dim is not None and encoder.edge_dim > 0 else None
 
-        if edge_out_dim is None:
-            edge_out_dim = inferred_edge_out_dim
-        self.edge_out_dim = edge_out_dim
-
-        if edge_decoder_type == "inner_product":
-            if edge_out_dim != 1:
-                raise ValueError("inner_product decoder only supports edge_out_dim=1")
-            self.edge_decoder = InnerProductEdgeDecoder(apply_sigmoid=False)
-        elif edge_decoder_type == "mlp":
-            self.edge_decoder = EdgeMLPDecoder(
+        if edge_presence_decoder_type == "inner_product":
+            self.edge_presence_decoder = InnerProductEdgeDecoder(apply_sigmoid=False)
+        elif edge_presence_decoder_type == "mlp":
+            self.edge_presence_decoder = EdgeMLPDecoder(
                 latent_dim=encoder.hidden_dim,
-                out_dim=edge_out_dim,
+                out_dim=1,
                 hidden_dim=decoder_hidden_dim,
                 dropout=dropout,
             )
         else:
-            raise ValueError("edge_decoder_type must be one of: 'inner_product', 'mlp'")
+            raise ValueError("edge_presence_decoder_type must be one of: 'inner_product', 'mlp'")
+
+        if edge_attr_out_dim is None:
+            edge_attr_out_dim = inferred_edge_attr_dim
+        self.edge_attr_out_dim = edge_attr_out_dim
+
+        self.edge_attr_decoder = None
+        if edge_attr_out_dim is not None:
+            if edge_attr_decoder_type != "mlp":
+                raise ValueError("edge_attr_decoder_type must be 'mlp' when edge_attr_out_dim is provided")
+            self.edge_attr_decoder = EdgeMLPDecoder(
+                latent_dim=encoder.hidden_dim,
+                out_dim=edge_attr_out_dim,
+                hidden_dim=decoder_hidden_dim,
+                dropout=dropout,
+            )
 
         self.node_decoder = None
         self.node_out_dim = None
@@ -189,8 +199,17 @@ class GAE(nn.Module):
     def encode(self, x, edge_index, edge_attr=None, batch=None) -> torch.Tensor:
         return self.encoder(x, edge_index, edge_attr=edge_attr, batch=batch)
 
-    def decode_edges(self, z: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
-        return self.edge_decoder(z, edge_index)
+    def decode_edge_presence(self, z: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
+        return self.edge_presence_decoder(z, edge_index)
+
+    def decode_edge_attrs(self, z: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor | None:
+        if self.edge_attr_decoder is None:
+            return None
+        return self.edge_attr_decoder(z, edge_index)
+
+    def decode_edges(self, z: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor | None:
+        """Backward-compatible alias for edge-attribute decoding."""
+        return self.decode_edge_attrs(z, edge_index)
 
     def decode_nodes(self, z: torch.Tensor) -> torch.Tensor | None:
         if self.node_decoder is None:
@@ -218,15 +237,15 @@ class GAE(nn.Module):
         pos_edge_index: torch.Tensor,
         neg_edge_index: torch.Tensor,
     ) -> torch.Tensor:
-        pos_logits_raw = self.decode_edges(z, pos_edge_index)
-        neg_logits_raw = self.decode_edges(z, neg_edge_index)
+        pos_logits_raw = self.decode_edge_presence(z, pos_edge_index)
+        neg_logits_raw = self.decode_edge_presence(z, neg_edge_index)
 
         if (pos_logits_raw.ndim > 1 and pos_logits_raw.shape[-1] != 1) or (
             neg_logits_raw.ndim > 1 and neg_logits_raw.shape[-1] != 1
         ):
             raise ValueError(
                 "recon_edge_loss expects scalar edge logits per edge. "
-                "Use edge_out_dim=1 or define a dedicated edge-attribute loss for multi-dimensional edge outputs."
+                "Use an edge-presence decoder with scalar outputs."
             )
 
         pos_logits = pos_logits_raw.view(-1)
@@ -264,7 +283,9 @@ class GAE(nn.Module):
         target_edge_attr: torch.Tensor,
         loss_type: str = "mse",
     ) -> torch.Tensor:
-        edge_attr_hat = self.decode_edges(z, edge_index)
+        edge_attr_hat = self.decode_edge_attrs(z, edge_index)
+        if edge_attr_hat is None:
+            raise ValueError("Edge attribute decoder is disabled. Provide edge_attr_out_dim to enable it.")
 
         if edge_attr_hat.ndim == 1:
             edge_attr_hat = edge_attr_hat.unsqueeze(-1)
@@ -352,9 +373,15 @@ class GAE(nn.Module):
         batch = getattr(data, "batch", None)
 
         z = self.encode(x, edge_index, edge_attr=edge_attr, batch=batch)
-        edge_logits = self.decode_edges(z, edge_index)
+        edge_presence_logits = self.decode_edge_presence(z, edge_index)
+        edge_attr_logits = self.decode_edge_attrs(z, edge_index)
         x_hat = self.decode_nodes(z)
-        return {"z": z, "edge_logits": edge_logits, "x_hat": x_hat}
+        return {
+            "z": z,
+            "edge_presence_logits": edge_presence_logits,
+            "edge_attr_logits": edge_attr_logits,
+            "x_hat": x_hat,
+        }
 
     def get_embedding(self, data) -> torch.Tensor:
         self.eval()
@@ -383,3 +410,16 @@ class GAE(nn.Module):
             graph_emb = global_mean_pool(z, batch)
 
         return None, graph_emb
+
+    def get_architecture_config(self) -> dict[str, object]:
+        """Return the decoder/encoder configuration needed to rebuild this model."""
+        return {
+            "model_type": "gae",
+            "edge_presence_decoder_type": (
+                "mlp" if isinstance(self.edge_presence_decoder, EdgeMLPDecoder) else "inner_product"
+            ),
+            "edge_attr_out_dim": self.edge_attr_out_dim,
+            "edge_attr_decoder_type": "mlp" if self.edge_attr_decoder is not None else None,
+            "decode_node_features": self.node_decoder is not None,
+            "node_out_dim": self.node_out_dim,
+        }
