@@ -17,8 +17,7 @@ from mmgnn.models.utils import build_encoder, build_model
 from mmgnn.training.features import FeatureSelector
 from mmgnn.training.plots import (
     plot_connectivity_heatmap,
-    plot_connectivity_triptych,
-    plot_embeddings,
+    plot_connectivity_triptych
 )
 from mmgnn.training.splits import DataSplitter
 from mmgnn.training.trainer import Trainer
@@ -523,13 +522,6 @@ def main() -> None:
     with open(output_dir / "evaluation_metrics.json", "w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=4)
     logging.info("Saved evaluation metrics to %s", output_dir / "evaluation_metrics.json")
-
-    plot_embeddings(train_embeddings, save_path=output_dir / "train_embeddings.png")
-    if val_embeddings is not None:
-        plot_embeddings(val_embeddings, val_targets, save_path=output_dir / "val_embeddings.png")
-    if test_embeddings is not None:
-        plot_embeddings(test_embeddings, test_targets, save_path=output_dir / "test_embeddings.png")
-
 
 if __name__ == "__main__":
     main()
