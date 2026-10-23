@@ -15,7 +15,7 @@ from mmgnn.models.utils import build_encoder, build_model
 from mmgnn.training.features import FeatureSelector
 from mmgnn.training.splits import DataSplitter
 from mmgnn.training.trainer import Trainer
-from mmgnn.training.plots import plot_embeddings, plot_training_history
+from mmgnn.training.plots import plot_training_history
 from mmgnn.utils.utils import (
     get_dataset_config_help,
     get_model_config_help,
@@ -218,16 +218,6 @@ def main() -> None:
         save_path=output_dir / "training_history.png",
         best_epoch=trainer.best_epoch,
     )
-
-    # Plot embeddings for train, val, and test sets
-    train_embeddings, train_targets = trainer.get_embeddings(train_loader)
-    plot_embeddings(train_embeddings, train_targets, save_path=output_dir / "train_embeddings.png")
-    if val_loader is not None:
-        val_embeddings, val_targets = trainer.get_embeddings(val_loader)
-        plot_embeddings(val_embeddings, val_targets, save_path=output_dir / "val_embeddings.png")
-    if test_loader is not None:
-        test_embeddings, test_targets = trainer.get_embeddings(test_loader)
-        plot_embeddings(test_embeddings, test_targets, save_path=output_dir / "test_embeddings.png")
 
     best_checkpoint_path = checkpoint_dir / f"checkpoint_epoch_{trainer.best_epoch}.pt"
     if best_checkpoint_path.exists():

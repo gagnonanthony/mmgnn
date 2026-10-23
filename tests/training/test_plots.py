@@ -6,38 +6,11 @@ import numpy as np
 import pytest
 
 from mmgnn.training.plots import (
-    _compute_embedding_tsne,
     plot_connectivity_heatmap,
     plot_connectivity_triptych,
     plot_contingency_heatmap,
-    plot_embeddings,
     plot_training_history,
 )
-
-
-class TestComputeEmbeddingTsne:
-    def test_shape(self):
-        emb = np.random.randn(20, 4)
-        coords, indices, mask = _compute_embedding_tsne(
-            emb, perplexity=5.0, random_state=0, max_iter=250
-        )
-        assert coords.shape == (20, 2)
-        assert indices.shape == (20,)
-        assert mask.shape == (20,)
-        assert mask.all()
-
-    def test_too_few_rows_raises(self):
-        with pytest.raises(ValueError, match="at least 2 finite"):
-            _compute_embedding_tsne(
-                np.ones((1, 3)), perplexity=0.5, random_state=0, max_iter=100
-            )
-
-    def test_bad_perplexity_raises(self):
-        emb = np.random.randn(10, 3)
-        with pytest.raises(ValueError, match="perplexity must be > 0"):
-            _compute_embedding_tsne(emb, perplexity=0.0, random_state=0, max_iter=100)
-        with pytest.raises(ValueError, match="smaller than the number of samples"):
-            _compute_embedding_tsne(emb, perplexity=10.0, random_state=0, max_iter=100)
 
 
 class TestPlotTrainingHistory:
@@ -94,16 +67,3 @@ class TestHeatmapValidation:
         b = np.eye(2)
         with pytest.raises(ValueError, match="Matrix shape mismatch"):
             plot_connectivity_triptych(a, b, title="t")
-
-
-class TestPlotEmbeddings:
-    def test_too_few_samples_raises(self):
-        with pytest.raises(ValueError, match="at least 2"):
-            plot_embeddings(np.ones((1, 4)), perplexity=0.5)
-
-    def test_save_smoke(self, tmp_path: Path):
-        emb = np.random.randn(15, 4)
-        out = tmp_path / "emb.png"
-        coords = plot_embeddings(emb, save_path=str(out), perplexity=5.0, max_iter=250)
-        assert out.is_file()
-        assert coords.shape == (15, 2)
